@@ -590,7 +590,7 @@ internal sealed class NativeSettingsPage : UserControl, IDisposable
                 string? host = Environment.GetEnvironmentVariable("WISP_SETTINGS_HOST_PATH")
                     ?? Path.Combine(AppContext.BaseDirectory, "settings-host", "wisp-tauri.exe");
                 var defaultDatabase = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                    "science.wisp-science", "wisp-science", "wisp.sqlite");
+                    "science.wisp-drug", "wisp-drug", "wisp.sqlite");
                 if (!string.Equals(Path.GetFullPath(database), Path.GetFullPath(defaultDatabase), StringComparison.OrdinalIgnoreCase))
                     host = null; // Never start a default-database host on behalf of an alternate database.
                 var connected = connectHost != null ? await connectHost() : await NativeSettingsClient.ConnectAsync(database, host, deadline.Token);

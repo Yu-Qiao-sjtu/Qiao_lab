@@ -84,6 +84,7 @@ const DOMAINS: &[&str] = &[
     "transcriptomics",
     "proteomics",
     "scientific-literature",
+    "drug-discovery",
 ];
 const RESEARCH_STAGES: &[&str] = &[
     "observation",
@@ -251,5 +252,15 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("unknown wisp.roles"));
+    }
+
+    #[test]
+    fn accepts_drug_discovery_domain() {
+        let (manifest, _) = parse_skill_document(
+            "---\nname: target-evaluation\ndescription: Judge one target.\nwisp:\n  schema_version: 1\n  domains: [drug-discovery]\n---\n# Body\n",
+            "fallback".into(),
+        )
+        .unwrap();
+        assert_eq!(manifest.wisp.unwrap().domains, ["drug-discovery"]);
     }
 }

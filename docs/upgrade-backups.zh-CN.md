@@ -18,9 +18,9 @@ Wisp 的数据库迁移只能向前执行。为了让出问题的升级可以撤
 
 副本写入应用数据目录下的 `backups/`，不会写进项目文件夹：
 
-- Windows：`%APPDATA%\science.wisp-science\wisp-science\backups\`
-- macOS：`~/Library/Application Support/science.wisp-science/wisp-science/backups/`
-- Linux：`~/.local/share/science.wisp-science/wisp-science/backups/`
+- Windows：`%APPDATA%\science.wisp-drug\wisp-drug\backups\`
+- macOS：`~/Library/Application Support/science.wisp-drug/wisp-drug/backups/`
+- Linux：`~/.local/share/science.wisp-drug/wisp-drug/backups/`
 
 文件名格式为 `<数据库>.<UTC 时间>.pre-<版本>.sqlite`，例如 `wisp.20261006-120301.pre-1.18.0.sqlite` 表示 `wisp.sqlite` 在 1.18.0 打开它之前的状态。每日副本的文件名为 `<数据库>.<UTC 时间>.daily.sqlite`。项目库的副本以 `project-<项目 ID>.` 开头，项目 ID 即项目 `.wisp/project.json` 中的 `project_id`。
 

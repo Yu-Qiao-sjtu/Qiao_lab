@@ -442,7 +442,7 @@ public sealed partial class WorkspaceConversationModel(INativeConversationClient
             string Field(string key) => bootstrap?[key]?.GetValue<string>() ?? "未记录";
             var model = Snapshot?.ModelId.StartsWith("acp:", StringComparison.Ordinal) == true
                 ? Snapshot.ModelId[4..] : Models.FirstOrDefault(m => m.Id == Snapshot?.ModelId)?.Label ?? Models.FirstOrDefault()?.Label ?? "not configured";
-            Prefill($"请帮我向 xuzhougeng/wisp-science 提交一个 GitHub issue。\n\n【已自动采集，请勿向我索要 API key、transcript、项目文件、环境变量、用户名或绝对路径】\n- Wisp 版本：{Field("app_version")}\n- OS / 架构：{Field("os")} / {Field("arch")}\n- 模型配置：{model}\n- 启动耗时：{Field("startup")}\n\n请用中文逐条引导我说明：发生了什么、复现步骤、预期与实际行为，以及我知道的 Run ID 或错误信息。\n若启动很慢或长时间白屏，提醒我在 Windows 正式版可把日志发给维护者：%APPDATA%\\science.wisp-science\\wisp-science\\logs\\wisp.log（上次启动：wisp.previous.log）。\n信息足够后，给出简短 issue 标题和 Markdown 正文，并提供预填链接：https://github.com/xuzhougeng/wisp-science/issues/new?title=...&body=...\n提醒截图需在 GitHub 页面手动附加，Wisp 不会上传截图。");
+            Prefill($"请帮我向 xuzhougeng/wisp-science 提交一个 GitHub issue。\n\n【已自动采集，请勿向我索要 API key、transcript、项目文件、环境变量、用户名或绝对路径】\n- Wisp 版本：{Field("app_version")}\n- OS / 架构：{Field("os")} / {Field("arch")}\n- 模型配置：{model}\n- 启动耗时：{Field("startup")}\n\n请用中文逐条引导我说明：发生了什么、复现步骤、预期与实际行为，以及我知道的 Run ID 或错误信息。\n若启动很慢或长时间白屏，提醒我在 Windows 正式版可把日志发给维护者：%APPDATA%\\science.wisp-drug\\wisp-drug\\logs\\wisp.log（上次启动：wisp.previous.log）。\n信息足够后，给出简短 issue 标题和 Markdown 正文，并提供预填链接：https://github.com/xuzhougeng/wisp-science/issues/new?title=...&body=...\n提醒截图需在 GitHub 页面手动附加，Wisp 不会上传截图。");
         }
         catch (Exception ex) { if (current == generation) { OperationError = ex.Message; Notify(); } }
     }

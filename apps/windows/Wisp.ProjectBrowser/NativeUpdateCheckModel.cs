@@ -6,7 +6,7 @@ namespace Wisp.ProjectBrowser;
 public sealed class NativeUpdateCheckModel(INativeSettingsClient client,
     Func<Task<bool>>? disableReminders = null) : WorkspaceActionModel
 {
-    public const string Releases = "https://github.com/xuzhougeng/wisp-science/releases";
+    public const string Releases = "https://github.com/Yu-Qiao-sjtu/Qiao_lab/releases";
     private readonly CancellationTokenSource lifetime = new();
     public JsonObject? Result { get; private set; }
     public bool DismissAttempted { get; private set; }

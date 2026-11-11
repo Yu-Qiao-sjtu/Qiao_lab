@@ -61,5 +61,5 @@ internal sealed class PreviewSettings
     }
 
     public string ResolveDatabase() => Environment.GetEnvironmentVariable("WISP_BROWSER_DATABASE") ?? DatabasePath
-        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "science.wisp-science", "wisp-science", "wisp.sqlite");
+        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "science.wisp-drug", "wisp-drug", "wisp.sqlite");
 }

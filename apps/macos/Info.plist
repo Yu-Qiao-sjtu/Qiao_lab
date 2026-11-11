@@ -4,7 +4,7 @@
 <dict>
     <key>CFBundleExecutable</key><string>WispScience</string>
     <!-- Keep the shipped identifier so existing preferences survive the rename. -->
-    <key>CFBundleIdentifier</key><string>science.wisp-science.native-preview</string>
+    <key>CFBundleIdentifier</key><string>science.wisp-drug.native-preview</string>
     <key>CFBundleName</key><string>Wisp Science SwiftUI</string>
     <key>CFBundleDisplayName</key><string>Wisp Science SwiftUI</string>
     <key>CFBundlePackageType</key><string>APPL</string>

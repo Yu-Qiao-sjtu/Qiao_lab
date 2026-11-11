@@ -31,9 +31,9 @@ before migration. Headless store users can call `maintain_daily_backups` explici
 Copies are written to `backups/` in the application data directory, never into
 a project folder:
 
-- Windows: `%APPDATA%\science.wisp-science\wisp-science\backups\`
-- macOS: `~/Library/Application Support/science.wisp-science/wisp-science/backups/`
-- Linux: `~/.local/share/science.wisp-science/wisp-science/backups/`
+- Windows: `%APPDATA%\science.wisp-drug\wisp-drug\backups\`
+- macOS: `~/Library/Application Support/science.wisp-drug/wisp-drug/backups/`
+- Linux: `~/.local/share/science.wisp-drug/wisp-drug/backups/`
 
 A file is named `<database>.<UTC time>.pre-<version>.sqlite`, for example
 `wisp.20261006-120301.pre-1.18.0.sqlite`: the state of `wisp.sqlite` just

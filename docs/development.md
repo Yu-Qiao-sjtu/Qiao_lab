@@ -302,8 +302,8 @@ repair the [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/web
 
 Packaged Windows and macOS builds have no console. Each launch writes
 `wisp.log` next to the database (Windows:
-`%APPDATA%\science.wisp-science\wisp-science\logs\wisp.log`; macOS:
-`~/Library/Application Support/science.wisp-science/wisp-science/logs/wisp.log`),
+`%APPDATA%\science.wisp-drug\wisp-drug\logs\wisp.log`; macOS:
+`~/Library/Application Support/science.wisp-drug/wisp-drug/logs/wisp.log`),
 keeping the previous launch as `wisp.previous.log`. Clicking the taskbar or Dock
 icon while Wisp is already running starts a short-lived process that hands over
 to the open window; it finds `wisp.log.lock` held by the running window, leaves

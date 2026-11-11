@@ -36,7 +36,7 @@ impl WorkspaceBrowser {
 pub fn app_data_root() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| std::env::temp_dir())
-        .join("science.wisp-science")
+        .join("science.wisp-drug")
 }
 
 /// Every build the workspace session knows about, in install-path order. Paths

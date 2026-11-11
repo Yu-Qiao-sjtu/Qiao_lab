@@ -7509,8 +7509,8 @@ struct SharedLogFile(Arc<StdMutex<launch_log::LaunchLog>>);
 impl SharedLogFile {
     fn create() -> Option<Self> {
         let dir = dirs::data_dir()?
-            .join("science.wisp-science")
-            .join("wisp-science")
+            .join("science.wisp-drug")
+            .join("wisp-drug")
             .join("logs");
         std::fs::create_dir_all(&dir).ok()?;
         let log = launch_log::LaunchLog::open(&dir).ok()?;

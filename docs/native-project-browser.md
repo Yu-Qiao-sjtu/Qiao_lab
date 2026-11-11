@@ -107,11 +107,11 @@ the same project model, without launching another host.
 
 This builds a debug app for the current architecture, bundles `wisp-service`, and
 applies an ad-hoc local signature. It is a local testing build, not a notarized release
-or universal installer. Its bundle ID is `science.wisp-science.native-preview`;
+or universal installer. Its bundle ID is `science.wisp-drug.native-preview`;
 it has separate preferences and no updater.
 
 The default database matches the current desktop location:
-`~/Library/Application Support/science.wisp-science/wisp-science/wisp.sqlite`.
+`~/Library/Application Support/science.wisp-drug/wisp-drug/wisp.sqlite`.
 Use **Choose database / 选择数据库** (Command-O) for another existing database;
 **Refresh / 刷新** (Command-R) reloads it. Database selection is remembered by the
 app. For development, `WISP_BROWSER_DATABASE` overrides the path and
@@ -174,7 +174,7 @@ preview, not an installer or an update to the installed Tauri application.
 For the downloadable standalone WinUI installer, size limits and the separate release
 workflow, see [WinUI releases](app-updates.md#winui-alongside-the-windows-webview-release).
 
-The default database is `%APPDATA%/science.wisp-science/wisp-science/wisp.sqlite`.
+The default database is `%APPDATA%/science.wisp-drug/wisp-drug/wisp.sqlite`.
 The preview caches its database selection, theme and palette in
 `%LOCALAPPDATA%/WispSciencePreview/settings.json`. `WISP_BROWSER_DATABASE` and
 `WISP_SERVICE_PATH` have the same meaning as on macOS. Ctrl+K opens home/project

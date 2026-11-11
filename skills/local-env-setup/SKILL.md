@@ -161,9 +161,9 @@ locations for users who already prepared them; it never creates them on launch:
 
 | OS | Desktop venv path |
 |---|---|
-| Windows | `%APPDATA%\science.wisp-science\wisp-science\python\.venv` |
-| macOS | `~/Library/Application Support/science.wisp-science/wisp-science/python/.venv` |
-| Linux | `~/.local/share/science.wisp-science/wisp-science/python/.venv` |
+| Windows | `%APPDATA%\science.wisp-drug\wisp-drug\python\.venv` |
+| macOS | `~/Library/Application Support/science.wisp-drug/wisp-drug/python/.venv` |
+| Linux | `~/.local/share/science.wisp-drug/wisp-drug/python/.venv` |
 
 ### Install uv
 

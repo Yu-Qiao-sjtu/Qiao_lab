@@ -67,7 +67,7 @@ Current controlled values (the parser is authoritative):
 | Field | Allowed values |
 | --- | --- |
 | `schema_version` | `1` |
-| `domains` | `general`, `bioinformatics`, `oncology`, `single-cell`, `genomics`, `transcriptomics`, `proteomics`, `scientific-literature` |
+| `domains` | `general`, `bioinformatics`, `oncology`, `single-cell`, `genomics`, `transcriptomics`, `proteomics`, `scientific-literature`, `drug-discovery` |
 | `research_stages` | `observation`, `retrieval`, `analysis`, `hypothesis`, `validation`, `synthesis` |
 | `roles` | `retrieval`, `analyst`, `planner`, `critic`, `validator`, `synthesizer` |
 | `evidence_types` | `literature`, `project-data`, `omics`, `single-cell`, `computational`, `experimental` |

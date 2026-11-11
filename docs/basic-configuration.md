@@ -44,7 +44,7 @@
 - **未检测到**的工具标为「建议安装」并默认勾选，点 **安装所选** 即可。
 - 现在不想装也可以直接点 **开始使用** 跳过，之后在 **设置 → 常规 → 本地环境**（或能力页）安装，或在对话里让 Wisp 用 `local-env-setup` 配置。
 
-- **装到哪里**：全部装进 Wisp 自己的应用数据目录（页面上会显示完整路径，例如 macOS 的 `~/Library/Application Support/science.wisp-science/wisp-science/toolchain`），不需要管理员权限，不修改系统 PATH 或 shell 配置，也不会碰你自己的 `~/.pixi`。
+- **装到哪里**：全部装进 Wisp 自己的应用数据目录（页面上会显示完整路径，例如 macOS 的 `~/Library/Application Support/science.wisp-drug/wisp-drug/toolchain`），不需要管理员权限，不修改系统 PATH 或 shell 配置，也不会碰你自己的 `~/.pixi`。
 - **怎么装**：Wisp 先下载一个固定版本、校验 SHA-256 的 pixi，再从 conda-forge 把 uv、Python、R（含持久化 R 工具需要的 jsonlite）和 Node.js（含 npm）各装成一个独立环境。勾选 Python 时会同时安装 uv，并用 uv 创建 Wisp 的默认 Python 环境（`python/.venv`），装好常用分析包（pandas、requests 等）。
 - **网络**：下载走 **设置 → 网络** 的「代码请求」代理；填写了 Conda 通道镜像时用它代替 conda-forge（请填写 conda-forge 的镜像地址），Python 包索引和 CA 证书包也会生效。
 - **进度**：按钮下方显示当前步骤和最近的安装输出。安装在后台进行，关掉引导或设置页也不会中断；重新打开能看到进度。可以点 **停止安装**，已完成的工具会保留，之后点 **重试** 从断点继续。

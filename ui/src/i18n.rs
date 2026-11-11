@@ -2853,7 +2853,7 @@ fn lookup(locale: Locale, key: &str) -> Option<&'static str> {
              - Startup timings: {startup}\n\n\
              Guide me in plain language: what happened, steps to reproduce, expected vs actual behavior, and any Run ID or error text I know.\n\
              If startup was slow or the window stayed blank, remind me that on Windows release builds the log is at \
-             %APPDATA%\\science.wisp-science\\wisp-science\\logs\\wisp.log (previous launch: wisp.previous.log).\n\
+             %APPDATA%\\science.wisp-drug\\wisp-drug\\logs\\wisp.log (previous launch: wisp.previous.log).\n\
              When we have enough detail, propose a short issue title plus a Markdown body with sections \
              (Problem, Steps to reproduce, Expected, Actual, Environment). \
              Then give a prefilled GitHub link using this base URL: {issue_base}?title=...&body=... \
@@ -6287,7 +6287,7 @@ Do not leave generated files in the project root.",
              - 启动耗时：{startup}\n\n\
              请用中文逐条引导我说明：发生了什么、复现步骤、预期与实际行为，以及我知道的 Run ID 或错误信息。\n\
              若启动很慢或长时间白屏，提醒我在 Windows 正式版可把日志发给维护者：\
-             %APPDATA%\\science.wisp-science\\wisp-science\\logs\\wisp.log（上次启动：wisp.previous.log）。\n\
+             %APPDATA%\\science.wisp-drug\\wisp-drug\\logs\\wisp.log（上次启动：wisp.previous.log）。\n\
              信息足够后，给出简短 issue 标题和 Markdown 正文（含问题描述、复现步骤、预期、实际、环境等小节），\
              并提供预填链接：{issue_base}?title=...&body=...\n\
              提醒截图需在 GitHub 页面手动附加，Wisp 不会上传截图。",

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex as StdMutex;
 use tauri::{ipc::Channel, AppHandle, State};
 
-const RELEASES_URL: &str = "https://github.com/xuzhougeng/wisp-science/releases";
+const RELEASES_URL: &str = "https://github.com/Yu-Qiao-sjtu/Qiao_lab/releases";
 
 #[derive(Deserialize)]
 pub(super) struct GithubRelease {
@@ -159,7 +159,7 @@ pub(super) async fn check_for_updates(
     }
 
     const LATEST_RELEASE_API: &str =
-        "https://api.github.com/repos/xuzhougeng/wisp-science/releases/latest";
+        "https://api.github.com/repos/Yu-Qiao-sjtu/Qiao_lab/releases/latest";
 
     let release = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))

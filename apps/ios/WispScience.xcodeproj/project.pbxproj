@@ -423,7 +423,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "science.wisp-science.ios";
+				PRODUCT_BUNDLE_IDENTIFIER = "science.wisp-drug.ios";
 				PRODUCT_NAME = WispScience;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -439,7 +439,7 @@
 				CLANG_ENABLE_OBJC_WEAK = YES;
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
-				PRODUCT_BUNDLE_IDENTIFIER = "science.wisp-science.ios.tests";
+				PRODUCT_BUNDLE_IDENTIFIER = "science.wisp-drug.ios.tests";
 				PRODUCT_NAME = WispScienceTests;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/WispScience.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/WispScience";
@@ -453,7 +453,7 @@
 				CLANG_ENABLE_OBJC_WEAK = YES;
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
-				PRODUCT_BUNDLE_IDENTIFIER = "science.wisp-science.ios.tests";
+				PRODUCT_BUNDLE_IDENTIFIER = "science.wisp-drug.ios.tests";
 				PRODUCT_NAME = WispScienceTests;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/WispScience.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/WispScience";
@@ -471,7 +471,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "science.wisp-science.ios.uitests";
+				PRODUCT_BUNDLE_IDENTIFIER = "science.wisp-drug.ios.uitests";
 				PRODUCT_NAME = WispScienceUITests;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_TARGET_NAME = WispScience;
@@ -493,7 +493,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "science.wisp-science.ios";
+				PRODUCT_BUNDLE_IDENTIFIER = "science.wisp-drug.ios";
 				PRODUCT_NAME = WispScience;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -513,7 +513,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "science.wisp-science.ios.uitests";
+				PRODUCT_BUNDLE_IDENTIFIER = "science.wisp-drug.ios.uitests";
 				PRODUCT_NAME = WispScienceUITests;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_TARGET_NAME = WispScience;
