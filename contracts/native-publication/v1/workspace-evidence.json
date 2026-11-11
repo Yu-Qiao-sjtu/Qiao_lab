@@ -1,0 +1,108 @@
+{
+  "schema": "wisp.native-publication.v1",
+  "command": "native_publication_workspace",
+  "project_id": "research-1",
+  "args": {},
+  "result": {
+    "publications": [
+      {
+        "id": "pub-1",
+        "project_id": "research-1",
+        "title": "RNA-seq paper",
+        "description": "Differential expression"
+      }
+    ],
+    "publication": {
+      "id": "pub-1",
+      "project_id": "research-1",
+      "title": "RNA-seq paper",
+      "description": "Differential expression"
+    },
+    "revision": {
+      "id": "rev-1",
+      "publication_id": "pub-1",
+      "revision_number": 1,
+      "label": "v1",
+      "state": "draft",
+      "capability_level": "archived",
+      "parent_revision_id": null,
+      "manifest_sha256": null,
+      "frozen_at": null
+    },
+    "items": [
+      {
+        "id": "section-1",
+        "revision_id": "rev-1",
+        "parent_item_id": null,
+        "title": "结果",
+        "kind": "section",
+        "ordinal": 0,
+        "content": ""
+      },
+      {
+        "id": "item-1",
+        "title": "The treatment changes expression",
+        "kind": "claim",
+        "ordinal": 1,
+        "revision_id": "rev-1",
+        "parent_item_id": "section-1",
+        "content": "处理改变基因表达，证据来自版本化差异表达表。"
+      }
+    ],
+    "revisions": [
+      {
+        "id": "rev-1",
+        "publication_id": "pub-1",
+        "revision_number": 1,
+        "label": "v1",
+        "state": "draft",
+        "capability_level": "archived",
+        "parent_revision_id": null,
+        "manifest_sha256": null,
+        "frozen_at": null
+      }
+    ],
+    "bindings": [
+      {
+        "id": "binding-1",
+        "revision_id": "rev-1",
+        "item_id": "item-1",
+        "source_kind": "artifact_version",
+        "source_id": "artifact-version-17",
+        "purpose": "差异表达结果",
+        "supported_claim_item_id": null,
+        "selection_state": "selected",
+        "review_state": "unreviewed",
+        "reproduction_state": "not_run",
+        "visibility": "private",
+        "source_snapshot_json": "{\"title\": \"counts.csv\", \"version\": 17}"
+      }
+    ],
+    "item_links": [],
+    "reviews": [
+      {
+        "binding_id": "binding-1",
+        "reviewer": "Reviewer",
+        "method": "manual",
+        "verified_at": 1,
+        "result": "pass",
+        "report_json": "{}"
+      }
+    ],
+    "supersessions": [],
+    "waivers": [
+      {
+        "finding_code": "fixture-warning",
+        "author": "Reviewer",
+        "reason": "Retained limitation"
+      }
+    ],
+    "drift": [],
+    "lineage": [],
+    "capsule_builds": [],
+    "reproduction_runs": [],
+    "reproduction_results": [],
+    "readiness": null,
+    "effective_capability_level": "archived"
+  }
+}

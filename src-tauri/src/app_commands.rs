@@ -1,0 +1,990 @@
+//! App Commands split out of lib.rs; shared state/helpers stay in the crate root.
+
+use super::*;
+
+#[cfg(target_os = "windows")]
+fn show_clickable_notification(
+    app: AppHandle,
+    window_label: String,
+    title: String,
+    body: String,
+    target: Option<serde_json::Value>,
+    focus_fallback_armed: bool,
+    silent: bool,
+) -> Result<(), String> {
+    use tauri_winrt_notification::{Sound, Toast};
+
+    // Unpackaged development binaries do not have an AppUserModelID. Keep the
+    // same PowerShell fallback used by the notification plugin in that case.
+    let app_id = if cfg!(debug_assertions) {
+        Toast::POWERSHELL_APP_ID.to_string()
+    } else {
+        app.config().identifier.clone()
+    };
+    let callback_app = app.clone();
+    let callback_label = window_label.clone();
+    // Toasts play the scheme's default sound unless told otherwise. While the
+    // app's own sound cue is on, that cue replaces it.
+    let sound = if silent { None } else { Some(Sound::Default) };
+    Toast::new(&app_id)
+        .title(&title)
+        .text1(&body)
+        .sound(sound)
+        .on_activated(move |_| {
+            // The native callback identifies the notification exactly, so it
+            // takes precedence over the latest-session focus fallback.
+            if !focus_fallback_armed || claim_notify_activation(&callback_label, target.is_some()) {
+                desktop_lifecycle::activate_workspace_window(
+                    &callback_app,
+                    &callback_label,
+                    target.clone(),
+                );
+            }
+            Ok(())
+        })
+        .show()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn show_clickable_notification(
+    app: AppHandle,
+    window_label: String,
+    title: String,
+    body: String,
+    target: Option<serde_json::Value>,
+    focus_fallback_armed: bool,
+    // The banner never sets a sound here, so the sound cue already plays alone.
+    _silent: bool,
+) -> Result<(), String> {
+    // Unbundled development binaries have no bundle identifier, which the
+    // notification center requires; borrow Terminal's. Process-global and
+    // intentionally first-wins.
+    if tauri::is_dev() {
+        let _ = mac_notification_sys::set_application("com.apple.Terminal");
+    }
+    crate::mac_notifications::show(
+        title,
+        body,
+        crate::mac_notifications::Click {
+            app,
+            window_label,
+            target,
+            focus_fallback_armed,
+        },
+    )
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn show_clickable_notification(
+    app: AppHandle,
+    _window_label: String,
+    title: String,
+    body: String,
+    _target: Option<serde_json::Value>,
+    _focus_fallback_armed: bool,
+    // The plugin's builder sets no sound, so the sound cue already plays alone.
+    _silent: bool,
+) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|error| error.to_string())
+}
+
+/// Desktop notification for task status (#327). No-op while a foreground
+/// window is showing that very session (the in-app UI already shows the
+/// state); a session finishing behind another project window, or behind
+/// another conversation of the same project, still notifies (#1619). The banner
+/// and the sound cue (#1595) are switched separately in settings; this is a
+/// no-op only when both are off. Clicking the notification navigates to the
+/// session it was about (#434) — native callbacks also restore a
+/// hidden/minimized window (#499).
+#[tauri::command]
+pub(super) async fn notify_user(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    title: String,
+    body: String,
+    session_id: String,
+) -> Result<(), String> {
+    if session_in_foreground(
+        &foreground_window_labels(window.app_handle()),
+        &session_id,
+        &state.viewed_frames(),
+    ) {
+        return Ok(());
+    }
+    let Some(announcement) = crate::notification_sound::Announcement::new(
+        load_notifications_enabled(&state.store).await,
+        crate::notification_sound::load_cue(&state.store).await,
+    ) else {
+        return Ok(());
+    };
+    // Every window of the session's project gets the live agent event, and
+    // windows of other projects get `session-notice`, so several windows call
+    // this command for one event. Select one exact owner, rather than only
+    // checking the project: two windows may legitimately show different
+    // conversations from the same project.
+    let project_id = state
+        .store
+        .frame_project_id(&session_id)
+        .await
+        .ok()
+        .flatten();
+    let Some(selection) = state.preferred_notification_window(&session_id, project_id.as_deref())
+    else {
+        return Ok(());
+    };
+    if selection.label != window.label() {
+        return Ok(());
+    }
+    // Only the owning window gets here, so one event plays one sound.
+    if let Some(sound) = announcement.sound {
+        if let Err(error) = crate::notification_sound::play(sound) {
+            tracing::warn!(target: "wisp", %error, "notification sound failed");
+        }
+    }
+    if !announcement.banner {
+        // Without a banner there is nothing to click, so leave the focus
+        // fallback unarmed: refocusing the window must not switch sessions.
+        return Ok(());
+    }
+    // Keep the taskbar/Dock focus fallback only when this window still belongs
+    // to the session's project. A foreign-project fallback may show the native
+    // notification, but ordinary focus must not replace its current project;
+    // an explicit notification click can still navigate there.
+    let target = project_id
+        .map(|project_id| serde_json::json!({ "projectId": project_id, "sessionId": session_id }));
+    let focus_fallback_armed = selection.arm_focus_navigation && target.is_some();
+    if focus_fallback_armed {
+        let target = target.as_ref().expect("target checked above");
+        pending_notify_targets()
+            .lock()
+            .unwrap()
+            .insert(window.label().to_string(), target.clone());
+    }
+    show_clickable_notification(
+        window.app_handle().clone(),
+        window.label().to_string(),
+        title,
+        body,
+        target,
+        focus_fallback_armed,
+        announcement.silent_banner(),
+    )
+}
+
+#[tauri::command]
+pub(super) async fn pick_directory(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |p| {
+        let _ = tx.send(p);
+    });
+    let picked = rx.await.map_err(|e| format!("{e}"))?;
+    Ok(picked.map(|fp| fp.to_string()))
+}
+
+/// Pick a local interpreter executable (python / Rscript) via the native open
+/// dialog. Returns the picked path, or `None` if the user cancelled.
+#[tauri::command]
+pub(super) async fn pick_executable_file(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_file(move |p| {
+        let _ = tx.send(p);
+    });
+    let picked = rx.await.map_err(|e| format!("{e}"))?;
+    Ok(picked.map(|fp| fp.to_string()))
+}
+
+/// Upload local files or directories into the remote directory shown in Files.
+/// When `source_paths` is omitted, opens the native multi-file picker.
+#[tauri::command]
+pub(super) async fn upload_to_context(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    context_id: String,
+    destination_dir: String,
+    source_paths: Option<Vec<String>>,
+) -> Result<Vec<crate::run_context::UploadToContextItem>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let paths = match source_paths {
+        Some(paths) if !paths.is_empty() => paths,
+        Some(_) => return Ok(Vec::new()),
+        None => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            app.dialog().file().pick_files(move |picked| {
+                let _ = tx.send(picked);
+            });
+            match rx.await.map_err(|e| format!("{e}"))? {
+                Some(files) if !files.is_empty() => {
+                    files.into_iter().map(|path| path.to_string()).collect()
+                }
+                _ => return Ok(Vec::new()),
+            }
+        }
+    };
+    let ap = state.require_active(window.label())?;
+    let frame_id = state.active_frame(window.label());
+    crate::run_context::submit_local_uploads_to_context(
+        &state.store,
+        &state.run_manager,
+        &ap.id,
+        frame_id.as_deref(),
+        &context_id,
+        &destination_dir,
+        &paths,
+    )
+    .await
+}
+
+/// Copy a workspace file to a user-chosen location via the native save dialog.
+/// Returns the saved path, or `None` if the user cancelled.
+pub(super) fn parse_ssh_artifact_uri(uri: &str) -> Option<(String, String)> {
+    let rest = uri.strip_prefix("ssh://")?;
+    let (context, path) = rest.split_once('/')?;
+    if context.is_empty() || path.is_empty() {
+        return None;
+    }
+    let remote_path = if path.starts_with("~/") {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    Some((format!("ssh:{context}"), remote_path))
+}
+
+#[tauri::command]
+pub(super) async fn download_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    path: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    // Resolve against the active frame's working project so downloads inside
+    // an exploration branch read that branch's workspace, not the mainline.
+    let (ap, _scope) =
+        crate::exploration_commands::working_project_for_active_frame(&state, window.label())
+            .await?;
+    let remote = parse_ssh_artifact_uri(&path);
+    let local = if remote.is_none() {
+        let real = wisp_tools::safety::validate_file_path(&ap.root, &path)?;
+        if !real.is_file() {
+            return Err(format!("file not found: {path}"));
+        }
+        Some(real)
+    } else {
+        None
+    };
+    let default_name = std::path::Path::new(
+        remote
+            .as_ref()
+            .map(|(_, path)| path.as_str())
+            .unwrap_or_else(|| local.as_ref().unwrap().to_str().unwrap_or("download")),
+    )
+    .file_name()
+    .and_then(|n| n.to_str())
+    .unwrap_or("download")
+    .to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(&default_name)
+        .save_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(dest) = rx.await.map_err(|e| format!("{e}"))? else {
+        return Ok(None); // user cancelled
+    };
+    let dest_path = std::path::PathBuf::from(dest.to_string());
+    if let Some((context_id, remote_path)) = remote {
+        crate::run_context::remote_files::refuse_if_project_context_path_discarded(
+            &state.store,
+            &ap.id,
+            &context_id,
+            &remote_path,
+        )
+        .await?;
+        let frame_id = state.active_frame(window.label());
+        let context = state
+            .store
+            .get_execution_context(&context_id)
+            .await
+            .map_err(|e| format!("{e}"))?
+            .ok_or_else(|| format!("SSH execution context not found: {context_id}"))?;
+        state
+            .run_manager
+            .download_ssh_file(
+                &state.store,
+                &ap.id,
+                frame_id.as_deref(),
+                &context,
+                &remote_path,
+                &dest_path,
+            )
+            .await?;
+    } else {
+        tokio::fs::copy(local.unwrap(), &dest_path)
+            .await
+            .map_err(|e| format!("copy failed: {e}"))?;
+    }
+    Ok(Some(dest_path.to_string_lossy().into_owned()))
+}
+
+/// Keep only a safe file-name component for the share-image save dialog.
+pub(super) fn share_image_file_name(default_name: &str) -> String {
+    std::path::Path::new(default_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != ".." && !name.contains('\0'))
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| "wisp-share.png".to_string())
+}
+
+/// A user can replace the whole suggested name in a native save dialog. On
+/// Windows that may also remove the hidden `.html` suffix, after which a
+/// browser treats the UTF-8 document as plain text and shows its source. Keep
+/// the chosen name, including Unicode and spaces, but restore the file type.
+fn share_html_destination(mut path: std::path::PathBuf) -> std::path::PathBuf {
+    let is_html = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("html"));
+    if !is_html {
+        let mut name = path
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_else(|| std::ffi::OsString::from("wisp-share"));
+        name.push(".html");
+        path.set_file_name(name);
+    }
+    path
+}
+
+// Generous ceiling for one long conversation image (base64 of ~48 MB PNG).
+const MAX_SHARE_PNG_BASE64_BYTES: usize = 64 * 1024 * 1024;
+
+/// Save a frontend-rendered `/share` PNG through the native save dialog.
+/// Returns the saved path, or `None` when the user cancels.
+#[tauri::command]
+pub(super) async fn save_share_image(
+    app: AppHandle,
+    png_base64: String,
+    default_name: String,
+) -> Result<Option<String>, String> {
+    use base64::Engine;
+    use tauri_plugin_dialog::DialogExt;
+    if png_base64.len() > MAX_SHARE_PNG_BASE64_BYTES {
+        return Err("share image exceeds the size limit".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(png_base64.trim())
+        .map_err(|e| format!("invalid base64: {e}"))?;
+    if bytes.is_empty() {
+        return Err("share image is empty".into());
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(&share_image_file_name(&default_name))
+        .save_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(dest) = rx.await.map_err(|e| format!("{e}"))? else {
+        return Ok(None); // user cancelled
+    };
+    let dest_path = std::path::PathBuf::from(dest.to_string());
+    tokio::fs::write(&dest_path, bytes)
+        .await
+        .map_err(|e| format!("write failed: {e}"))?;
+    Ok(Some(dest_path.to_string_lossy().into_owned()))
+}
+
+// Multi-image `/share` export: a carousel rarely needs more than a few dozen
+// pages; the total keeps one IPC payload bounded.
+const MAX_SHARE_PAGES: usize = 200;
+const MAX_SHARE_PAGES_BASE64_BYTES: usize = 256 * 1024 * 1024;
+
+/// Numbered page paths next to the name the user picked: `name.png` becomes
+/// `name-1.png` … `name-N.png` (zero-padded so they sort). The dialog only
+/// confirms overwriting the picked name, so when any page name is taken the
+/// set moves to `name (2)-1.png` … instead of replacing files.
+fn share_page_paths(
+    picked: &std::path::Path,
+    count: usize,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Vec<std::path::PathBuf> {
+    let dir = picked
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    // Drop only a `.png` suffix: "report.v2" keeps its dot.
+    let png = picked
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+    let stem = if png {
+        picked.file_stem()
+    } else {
+        picked.file_name()
+    }
+    .map(|stem| stem.to_string_lossy().into_owned())
+    .filter(|stem| !stem.is_empty())
+    .unwrap_or_else(|| "wisp-share".to_string());
+    let digits = count.max(1).to_string().len();
+    let pages_for = |base: &str| -> Vec<std::path::PathBuf> {
+        (1..=count)
+            .map(|page| dir.join(format!("{base}-{page:0digits$}.png")))
+            .collect()
+    };
+    let mut paths = pages_for(&stem);
+    let mut copy = 2;
+    while paths.iter().any(|path| exists(path)) && copy < 1000 {
+        paths = pages_for(&format!("{stem} ({copy})"));
+        copy += 1;
+    }
+    paths
+}
+
+/// Save frontend-rendered `/share` pages through one native save dialog.
+/// Returns the saved paths in page order, or `None` when the user cancels.
+#[tauri::command]
+pub(super) async fn save_share_images(
+    app: AppHandle,
+    pngs_base64: Vec<String>,
+    default_name: String,
+) -> Result<Option<Vec<String>>, String> {
+    use base64::Engine;
+    use tauri_plugin_dialog::DialogExt;
+    if pngs_base64.is_empty() {
+        return Err("share image is empty".into());
+    }
+    if pngs_base64.len() > MAX_SHARE_PAGES {
+        return Err(format!(
+            "share export has more than {MAX_SHARE_PAGES} pages"
+        ));
+    }
+    let total: usize = pngs_base64.iter().map(String::len).sum();
+    if total > MAX_SHARE_PAGES_BASE64_BYTES
+        || pngs_base64
+            .iter()
+            .any(|png| png.len() > MAX_SHARE_PNG_BASE64_BYTES)
+    {
+        return Err("share image exceeds the size limit".into());
+    }
+    let mut pages = Vec::with_capacity(pngs_base64.len());
+    for png in &pngs_base64 {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(png.trim())
+            .map_err(|e| format!("invalid base64: {e}"))?;
+        if bytes.is_empty() {
+            return Err("share image is empty".into());
+        }
+        pages.push(bytes);
+    }
+    drop(pngs_base64);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("PNG", &["png"])
+        .set_file_name(&share_image_file_name(&default_name))
+        .save_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(dest) = rx.await.map_err(|e| format!("{e}"))? else {
+        return Ok(None); // user cancelled
+    };
+    let picked = std::path::PathBuf::from(dest.to_string());
+    let paths = share_page_paths(&picked, pages.len(), std::path::Path::exists);
+    for (path, bytes) in paths.iter().zip(pages) {
+        tokio::fs::write(path, bytes)
+            .await
+            .map_err(|e| format!("write failed: {e}"))?;
+    }
+    Ok(Some(
+        paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+    ))
+}
+
+// Generous ceiling for one self-contained share HTML document.
+const MAX_SHARE_HTML_BYTES: usize = 16 * 1024 * 1024;
+
+/// Save a frontend-built `/share` HTML document through the native save
+/// dialog. Returns the saved path, or `None` when the user cancels.
+#[tauri::command]
+pub(super) async fn save_share_html(
+    app: AppHandle,
+    html: String,
+    default_name: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    if html.len() > MAX_SHARE_HTML_BYTES {
+        return Err("share HTML exceeds the size limit".into());
+    }
+    if html.trim().is_empty() {
+        return Err("share HTML is empty".into());
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("HTML", &["html"])
+        .set_file_name(&share_image_file_name(&default_name))
+        .save_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(dest) = rx.await.map_err(|e| format!("{e}"))? else {
+        return Ok(None); // user cancelled
+    };
+    let dest_path = share_html_destination(std::path::PathBuf::from(dest.to_string()));
+    tokio::fs::write(&dest_path, html)
+        .await
+        .map_err(|e| format!("write failed: {e}"))?;
+    Ok(Some(dest_path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+pub(super) async fn get_capabilities(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+) -> Result<Capabilities, String> {
+    let ap = state.require_active(window.label())?;
+    let tags = load_skill_tags(&state.store).await;
+    let (catalog, enabled) = project_skill_catalog(&state.store, &ap).await;
+    let skills = skill_infos(&catalog, &tags, enabled.as_ref());
+    let skill_counts = capability_skill_counts(&skills);
+    let mcp_counts = capability_mcp_counts(&state.store, &ap).await;
+    let mut project = build_project_info(&state, window.label()).await?;
+    project.skill_count = skill_counts.total();
+    project.mcp_server_count = mcp_counts.total();
+    Ok(Capabilities {
+        skills,
+        mcp_servers: list_mcp_servers(&ap.root),
+        memory_files: list_memory_files(&ap.memory),
+        project,
+        skill_counts,
+        mcp_counts,
+    })
+}
+
+pub(super) fn capability_skill_counts(skills: &[SkillInfo]) -> CapabilitySourceCounts {
+    let mut counts = CapabilitySourceCounts::default();
+    for skill in skills.iter().filter(|skill| skill.enabled) {
+        if skill.scope == SkillSource::Bundled.as_str() {
+            counts.bundled += 1;
+        } else {
+            counts.project += 1;
+        }
+    }
+    counts
+}
+
+async fn capability_mcp_counts(store: &Store, project: &ActiveProject) -> CapabilitySourceCounts {
+    let custom = load_mcp_connections(store)
+        .await
+        .into_iter()
+        .filter(|connection| connection.enabled)
+        .count();
+    let (plugin_launches, plugin_errors) =
+        plugins::enabled_plugin_mcp_launches(store, &project.id).await;
+    let user = crate::mcp_connections::user_config().servers.len();
+    CapabilitySourceCounts {
+        bundled: list_mcp_servers(&project.root).len(),
+        // Invalid plugin launch configurations are still configured project
+        // MCP services and remain visible as unavailable in Settings.
+        project: custom + plugin_launches.len() + plugin_errors.len() + user,
+    }
+}
+
+#[tauri::command]
+pub(super) async fn get_onboarding_state(
+    state: State<'_, AppState>,
+) -> Result<OnboardingState, String> {
+    let (_, _, _, api_key) = load_settings(&state.store).await;
+    let done = state
+        .store
+        .get_setting("onboarding_done")
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    Ok(OnboardingState {
+        show: !done,
+        has_api_key: !api_key.is_empty(),
+    })
+}
+
+pub(super) fn initial_bootstrap(workspace: &std::path::Path, skills: usize) -> BootstrapStatus {
+    let mut status = BootstrapStatus {
+        skills_loaded: skills,
+        python_ok: false,
+        local_environment: None,
+        mcp_catalog: list_mcp_servers(workspace).len(),
+        uv_ok: false,
+        node_ok: false,
+        npm_ok: false,
+        sci_ok: false,
+        pixi_ok: false,
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        os: std::env::consts::OS.into(),
+        arch: std::env::consts::ARCH.into(),
+        workspace: workspace.to_string_lossy().into_owned(),
+        // Filled in on read: the launch is not over yet at this point.
+        startup: String::new(),
+        errors: vec![],
+    };
+    if status.skills_loaded == 0 {
+        status
+            .errors
+            .push("No bundled skills found in install resources.".into());
+    }
+    status
+}
+
+/// Only filesystem/PATH discovery: never executes an interpreter, uv, or an installer.
+fn discover_local_paths(
+    app_data: &std::path::Path,
+    config: &serde_json::Value,
+) -> wisp_dto::LocalEnvironmentStatus {
+    use wisp_runtime::PythonEnv;
+    // Tools Wisp installed itself are found after PATH, so a user's own
+    // installation keeps priority unless the install saved its paths.
+    let managed = crate::toolchain::Layout::new(app_data);
+    let or_managed =
+        |found: Option<std::path::PathBuf>, name: &str| found.or_else(|| managed.find(name));
+    let paths = [
+        ("python_executable", PythonEnv::find_python(app_data)),
+        (
+            "rscript_executable",
+            or_managed(wisp_runtime::find_rscript(), "Rscript"),
+        ),
+        ("uv_executable", or_managed(PythonEnv::find_uv(), "uv")),
+        (
+            "node_executable",
+            or_managed(PythonEnv::find_node(), "node"),
+        ),
+        ("npm_executable", or_managed(PythonEnv::find_npm(), "npm")),
+        ("sci_executable", or_managed(PythonEnv::find_sci(), "sci")),
+        (
+            "pixi_executable",
+            or_managed(PythonEnv::find_pixi(), "pixi"),
+        ),
+        ("cua_driver_executable", PythonEnv::find_cua_driver()),
+    ]
+    .into_iter()
+    .filter_map(|(name, path)| {
+        configured_or_detected_path(config, name, path)
+            .filter(|path| path.is_file())
+            .map(|path| (name.into(), path.to_string_lossy().into_owned()))
+    })
+    .collect();
+    wisp_dto::LocalEnvironmentStatus {
+        paths,
+        warning: None,
+    }
+}
+
+pub(super) fn configured_or_detected_path(
+    config: &serde_json::Value,
+    name: &str,
+    discovered: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let legacy = match name {
+        "python_executable" => "python_path",
+        "rscript_executable" => "rscript_path",
+        _ => name,
+    };
+    if let Some(path) = [name, legacy].into_iter().find_map(|key| {
+        config
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    }) {
+        // Report the interpreter Wisp will actually use, including configured
+        // installations outside PATH. A broken override stays missing until
+        // the user changes it; never present an unrelated discovery as ready.
+        let configured = std::path::PathBuf::from(path);
+        return if configured.is_file() {
+            Some(configured)
+        } else {
+            which::which(path).ok()
+        };
+    }
+    discovered
+}
+
+pub(super) fn finish_environment_detection(
+    status: &mut BootstrapStatus,
+    report: wisp_dto::LocalEnvironmentStatus,
+) {
+    status.python_ok = report.paths.contains_key("python_executable");
+    status.uv_ok = report.paths.contains_key("uv_executable");
+    status.node_ok = report.paths.contains_key("node_executable");
+    status.npm_ok = report.paths.contains_key("npm_executable");
+    status.sci_ok = report.paths.contains_key("sci_executable");
+    status.pixi_ok = report.paths.contains_key("pixi_executable");
+    status.local_environment = Some(report);
+}
+
+/// Local's saved configuration; null when it cannot be read.
+pub(super) async fn local_environment_config(store: &Store) -> serde_json::Value {
+    store
+        .get_execution_context("local")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|context| serde_json::from_str(&context.config_json).ok())
+        .unwrap_or_default()
+}
+
+async fn detect_environment(app: &tauri::AppHandle) -> BootstrapStatus {
+    let state = app.state::<AppState>();
+    let app_data = state.app_data.clone();
+    let config = local_environment_config(&state.store).await;
+    let mut report = tokio::task::spawn_blocking(move || discover_local_paths(&app_data, &config))
+        .await
+        .unwrap_or_else(|error| wisp_dto::LocalEnvironmentStatus {
+            warning: Some(format!("Environment detection unavailable: {error}")),
+            ..Default::default()
+        });
+    if report.warning.is_none() {
+        if let Err(error) = state.store.save_detected_local_paths(&report.paths).await {
+            report.warning = Some(format!("Could not save detected paths to Local: {error}"));
+        }
+    }
+    let status = {
+        let mut status = state.bootstrap.lock().unwrap();
+        finish_environment_detection(&mut status, report);
+        with_startup_report(status.clone())
+    };
+    let _ = app.emit("bootstrap-status", status.clone());
+    status
+}
+
+#[tauri::command]
+pub(super) async fn detect_local_environment(app: tauri::AppHandle) -> BootstrapStatus {
+    detect_environment(&app).await
+}
+
+#[tauri::command]
+pub(super) async fn save_local_environment_paths(
+    app: tauri::AppHandle,
+    paths: std::collections::BTreeMap<String, String>,
+) -> Result<BootstrapStatus, String> {
+    validate_local_environment_paths(&paths)?;
+    app.state::<AppState>()
+        .store
+        .save_local_environment_paths(&paths)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(detect_environment(&app).await)
+}
+
+pub(super) fn validate_local_environment_paths(
+    paths: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    // Validate filesystem references only; never run user-supplied executables.
+    for (key, value) in paths {
+        let path = value.trim();
+        if !path.is_empty() && !std::path::Path::new(path).is_file() {
+            return Err(format!("{key}: file not found: {path}"));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn start_environment_detection(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        detect_environment(&handle).await;
+    });
+}
+
+/// Stamp the current launch timings onto a status snapshot. They are collected
+/// while the app boots, so they are attached when the status is read rather
+/// than when it is built.
+fn with_startup_report(mut status: BootstrapStatus) -> BootstrapStatus {
+    status.startup = crate::startup_report_summary();
+    status
+}
+
+#[tauri::command]
+pub(super) fn get_bootstrap_status(state: State<'_, AppState>) -> BootstrapStatus {
+    with_startup_report(state.bootstrap.lock().unwrap().clone())
+}
+
+#[tauri::command]
+pub(super) fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// Open the first available browser on its extension manager page for the
+/// offline banner's setup button. Never fails: `opened` reports whether a
+/// browser was actually launched, so the UI can fall back to manual steps.
+#[tauri::command]
+pub(super) fn open_browser_extension_page(
+    state: State<'_, AppState>,
+) -> wisp_dto::BrowserExtensionSetup {
+    state.browser_bridge.open_extension_setup()
+}
+
+/// Report whether the connected shared-browser extension matches this build.
+#[tauri::command]
+pub(super) async fn browser_extension_status(
+    state: State<'_, AppState>,
+) -> Result<wisp_dto::BrowserExtensionStatus, String> {
+    Ok(state.browser_bridge.extension_status().await)
+}
+
+/// Refresh the verified managed copy and reload it automatically when the
+/// connected extension supports that operation. Older extensions fall back to
+/// the extension-manager page with the exact stable path in the result.
+#[tauri::command]
+pub(super) async fn update_browser_extension(
+    state: State<'_, AppState>,
+) -> Result<wisp_dto::BrowserExtensionUpdateResult, String> {
+    Ok(state.browser_bridge.update_extension().await)
+}
+
+/// Live extension connection check for the offline banner's display gate.
+#[tauri::command]
+pub(super) async fn extension_connected(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.browser_bridge.extension_connected().await)
+}
+
+#[tauri::command]
+pub(super) fn reveal_in_file_manager(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    path: String,
+) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let ap = state.require_active(window.label())?;
+    let real = wisp_tools::safety::validate_file_path(&ap.root, &path)?;
+    if !real.exists() {
+        return Err(format!("file not found: {path}"));
+    }
+    app.opener()
+        .reveal_item_in_dir(&real)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(super) fn open_workspace_path(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    path: String,
+) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let ap = state.require_active(window.label())?;
+    let real = wisp_tools::safety::resolve_under_root(&ap.root, &path)?;
+    if !real.is_file() && !real.is_dir() {
+        return Err(format!("unsupported workspace entry: {path}"));
+    }
+    app.opener()
+        .open_path(real.to_string_lossy().into_owned(), None::<String>)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(super) async fn dismiss_onboarding(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .store
+        .set_setting("onboarding_done", "1")
+        .await
+        .map_err(|e| format!("{e}"))
+}
+
+#[cfg(test)]
+mod share_image_tests {
+    use super::{share_html_destination, share_image_file_name, share_page_paths};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn page_paths_number_pages_next_to_the_picked_name() {
+        let picked = Path::new("/out/wisp-share-2026-11-04.png");
+        assert_eq!(
+            share_page_paths(picked, 3, |_| false),
+            vec![
+                PathBuf::from("/out/wisp-share-2026-11-04-1.png"),
+                PathBuf::from("/out/wisp-share-2026-11-04-2.png"),
+                PathBuf::from("/out/wisp-share-2026-11-04-3.png"),
+            ]
+        );
+        // Ten or more pages are zero-padded so a file browser sorts them.
+        let many = share_page_paths(picked, 12, |_| false);
+        assert_eq!(many[0], PathBuf::from("/out/wisp-share-2026-11-04-01.png"));
+        assert_eq!(many[11], PathBuf::from("/out/wisp-share-2026-11-04-12.png"));
+        // A name typed without the extension still yields PNG pages.
+        assert_eq!(
+            share_page_paths(Path::new("/out/分析 结果"), 1, |_| false),
+            vec![PathBuf::from("/out/分析 结果-1.png")]
+        );
+        assert_eq!(
+            share_page_paths(Path::new("/out/report.v2"), 1, |_| false),
+            vec![PathBuf::from("/out/report.v2-1.png")]
+        );
+        assert_eq!(
+            share_page_paths(Path::new("/out/Share.PNG"), 1, |_| false),
+            vec![PathBuf::from("/out/Share-1.png")]
+        );
+    }
+
+    #[test]
+    fn page_paths_never_replace_existing_pages() {
+        let picked = Path::new("/out/share.png");
+        let taken = [
+            PathBuf::from("/out/share-2.png"),
+            PathBuf::from("/out/share (2)-1.png"),
+        ];
+        assert_eq!(
+            share_page_paths(picked, 2, |path| taken.iter().any(|t| t == path)),
+            vec![
+                PathBuf::from("/out/share (3)-1.png"),
+                PathBuf::from("/out/share (3)-2.png"),
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_only_a_safe_file_name_component() {
+        assert_eq!(
+            share_image_file_name("wisp-share-2026-08-14.png"),
+            "wisp-share-2026-08-14.png"
+        );
+        assert_eq!(share_image_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(share_image_file_name("/tmp/evil/name.png"), "name.png");
+        assert_eq!(share_image_file_name(""), "wisp-share.png");
+        assert_eq!(share_image_file_name(".."), "wisp-share.png");
+    }
+
+    #[test]
+    fn html_destination_restores_the_extension_after_rename() {
+        assert_eq!(
+            share_html_destination(std::path::PathBuf::from("分析 result 01")),
+            std::path::PathBuf::from("分析 result 01.html")
+        );
+        assert_eq!(
+            share_html_destination(std::path::PathBuf::from("report.HTML")),
+            std::path::PathBuf::from("report.HTML")
+        );
+        assert_eq!(
+            share_html_destination(std::path::PathBuf::from("report.txt")),
+            std::path::PathBuf::from("report.txt.html")
+        );
+    }
+}

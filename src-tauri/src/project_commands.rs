@@ -1,0 +1,1729 @@
+//! Project Commands split out of lib.rs; shared state/helpers stay in the crate root.
+
+use super::*;
+use crate::workspace_surface::WorkspaceManager;
+use std::collections::HashMap;
+use tauri::Manager;
+
+pub(crate) fn same_workspace_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => {
+            #[cfg(target_os = "windows")]
+            {
+                left.to_string_lossy()
+                    .eq_ignore_ascii_case(&right.to_string_lossy())
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                left == right
+            }
+        }
+        _ => false,
+    }
+}
+
+#[tauri::command]
+pub(super) async fn get_research_graph(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+) -> Result<wisp_store::ResearchGraph, String> {
+    let scope = exploration_commands::active_frame_scope(&state, window.label()).await?;
+    state
+        .store
+        .research_graph_in_scope(&scope)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(super) async fn get_research_calendar(
+    state: State<'_, AppState>,
+    project_ids: Vec<String>,
+    from: i64,
+    until: i64,
+) -> Result<Vec<wisp_dto::ResearchCalendarProject>, String> {
+    state
+        .store
+        .research_calendar(&project_ids, from, until)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(super) async fn get_research_journey(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    from: i64,
+    until: i64,
+) -> Result<wisp_dto::ResearchJourney, String> {
+    let scope = exploration_commands::active_frame_scope(&state, window.label()).await?;
+    state
+        .store
+        .research_journey(&scope, from, until)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(super) async fn add_research_journal_entry(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    input: wisp_dto::ResearchJournalInput,
+) -> Result<String, String> {
+    let scope = exploration_commands::active_frame_scope(&state, window.label()).await?;
+    state
+        .store
+        .add_research_journal_entry(&scope, &input)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Memos are read for the window's working project only, so a project hidden
+/// by privacy mode is never reachable by id from the UI.
+async fn memo_project(
+    state: &AppState,
+    window: &crate::workspace_surface::WorkspaceSurface,
+) -> Result<String, String> {
+    let (project, _) =
+        exploration_commands::working_project_for_active_frame(state, window.label()).await?;
+    Ok(project.id)
+}
+
+#[tauri::command]
+pub(super) async fn list_project_memos(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+) -> Result<Vec<wisp_dto::ProjectMemo>, String> {
+    let project_id = memo_project(&state, &window).await?;
+    state
+        .store
+        .list_project_memos(&project_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(super) async fn add_project_memo(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    input: wisp_dto::ProjectMemoInput,
+) -> Result<wisp_dto::ProjectMemo, String> {
+    let project_id = memo_project(&state, &window).await?;
+    state
+        .store
+        .add_project_memo(&project_id, &input)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(super) async fn update_project_memo(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    patch: wisp_dto::ProjectMemoPatch,
+) -> Result<wisp_dto::ProjectMemo, String> {
+    let project_id = memo_project(&state, &window).await?;
+    state
+        .store
+        .update_project_memo(&project_id, &patch)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(super) async fn delete_project_memo(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    memo_id: String,
+) -> Result<(), String> {
+    let project_id = memo_project(&state, &window).await?;
+    state
+        .store
+        .delete_project_memo(&project_id, &memo_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(super) async fn get_research_journey_source(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    version_id: String,
+) -> Result<wisp_dto::ResearchJourneySource, String> {
+    let scope = exploration_commands::active_frame_scope(&state, window.label()).await?;
+    state
+        .store
+        .research_journey_source(&scope, &version_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(super) async fn set_project_starred(
+    state: State<'_, AppState>,
+    id: String,
+    starred: bool,
+) -> Result<(), String> {
+    wisp_app::projects::set_project_starred(&state.store, &id, starred)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(super) async fn list_projects(
+    state: State<'_, AppState>,
+) -> Result<Vec<ProjectSummary>, String> {
+    let running = state.running_turns.lock().await.clone();
+    let awaiting = state.awaiting_confirm.lock().unwrap().clone();
+    wisp_app::projects::list_projects(&state.store, &running, &awaiting)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn matching_workspace_projects(
+    projects: Vec<ProjectSummary>,
+    workspace: &Path,
+) -> Vec<ProjectSummary> {
+    // A path match identifies candidates, never a project identity to merge or
+    // silently select. Older databases can contain several ids for one folder.
+    projects
+        .into_iter()
+        .filter(|project| same_workspace_path(workspace, Path::new(&project.workspace_dir)))
+        .collect()
+}
+
+#[tauri::command]
+pub(super) async fn list_workspace_projects(
+    state: State<'_, AppState>,
+    workspace_dir: String,
+) -> Result<Vec<ProjectSummary>, String> {
+    let workspace = Path::new(workspace_dir.trim());
+    if !workspace.is_dir() {
+        return Err("The selected workspace is not a directory.".into());
+    }
+    Ok(matching_workspace_projects(
+        list_projects(state).await?,
+        workspace,
+    ))
+}
+
+/// Filesystem and store writes for a new project. Callers supply the store
+/// directly: this does not read or change any WebView window's active project
+/// or session, and it does not create a conversation.
+pub(crate) async fn create_project_record(
+    store: &wisp_store::Store,
+    input: wisp_dto::native_projects::CreateProjectRequest,
+) -> Result<String, String> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err("Project name is required".into());
+    }
+    let dir = input.workspace_dir.trim();
+    if dir.is_empty() {
+        return Err("A working directory is required".into());
+    }
+    let path = PathBuf::from(dir);
+    std::fs::create_dir_all(&path)
+        .map_err(|e| format!("Failed to create working directory: {e}"))?;
+    if store
+        .list_projects()
+        .await
+        .map_err(|e| format!("{e}"))?
+        .iter()
+        .any(|project| same_workspace_path(&path, Path::new(&project.2)))
+    {
+        return Err("This folder is already registered as a project.".into());
+    }
+    // Writability probe: create + remove a temp marker.
+    let marker = path.join(".wisp-write-test");
+    std::fs::write(&marker, b"").map_err(|e| format!("Working directory is not writable: {e}"))?;
+    let _ = std::fs::remove_file(&marker);
+
+    let id = Uuid::new_v4().to_string();
+    // #405: opt-in. Unchecked means the user keeps their own structure, so we
+    // create nothing — the convention lives in .wisp/WISP.md instead (below).
+    if input.standard_layout {
+        workspace_manifest::init_workspace_layout(&path, &id, name)?;
+    }
+    store
+        .create_project(&id, name, dir)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    // Description (DB) + Agent Context (.wisp/WISP.md) — same storage as update_project.
+    let desc = input.description.trim();
+    if !desc.is_empty() {
+        store
+            .update_project(&id, name, desc)
+            .await
+            .map_err(|e| format!("{e}"))?;
+    }
+    let ctx = input.agent_context.trim();
+    if !ctx.is_empty() {
+        let wisp_dir = path.join(".wisp");
+        std::fs::create_dir_all(&wisp_dir)
+            .map_err(|e| format!("Failed to write Agent Context: {e}"))?;
+        std::fs::write(wisp_dir.join("WISP.md"), ctx)
+            .map_err(|e| format!("Failed to write Agent Context: {e}"))?;
+    }
+    Ok(id)
+}
+
+#[tauri::command]
+pub(super) async fn create_project(
+    state: State<'_, AppState>,
+    name: String,
+    workspace_dir: String,
+    description: String,
+    agent_context: String,
+    standard_layout: bool,
+) -> Result<ProjectSummary, String> {
+    let id = create_project_record(
+        &state.store,
+        wisp_dto::native_projects::CreateProjectRequest {
+            name,
+            workspace_dir,
+            description,
+            agent_context,
+            standard_layout,
+        },
+    )
+    .await?;
+    Ok(build_project_summary(&state, &id).await)
+}
+
+/// Cancel and drop every in-memory runtime belonging to `project_id`'s sessions
+/// (e.g. the project is being deleted). Other projects' sessions keep running —
+/// switching/closing a project must not stop unrelated work (#52). Call this
+/// *before* the project's frames are removed from the store.
+pub(super) async fn cancel_project_sessions(state: &AppState, project_id: &str) {
+    let frame_ids: Vec<String> = state
+        .store
+        .list_sessions(project_id)
+        .await
+        .map(|rows| rows.into_iter().map(|(id, ..)| id).collect())
+        .unwrap_or_default();
+    let runtimes = {
+        let sessions = state.sessions.lock().await;
+        frame_ids
+            .iter()
+            .filter_map(|fid| sessions.get(fid).cloned().map(|rt| (fid.clone(), rt)))
+            .collect::<Vec<_>>()
+    };
+    for (_, rt) in &runtimes {
+        rt.deleted.store(true, Ordering::SeqCst);
+        rt.cancel.store(true, Ordering::SeqCst);
+    }
+    for fid in &frame_ids {
+        acp::cancel_frame(state, fid).await;
+        mcp_connections::host().retire_frame(fid).await;
+    }
+    for (_, rt) in &runtimes {
+        let _workflow = rt.workflow.lock().await;
+        let _agent = rt.agent.lock().await;
+    }
+    for fid in &frame_ids {
+        acp::close_frame(state, fid).await;
+    }
+    {
+        let mut sessions = state.sessions.lock().await;
+        for fid in &frame_ids {
+            sessions.remove(fid);
+        }
+    }
+    let mut running = state.running_turns.lock().await;
+    for fid in &frame_ids {
+        running.remove(fid);
+    }
+}
+
+/// Point the backend's active project at `id`, rebuilding its skills/memory.
+/// Returns the resolved `(name, workspace_dir)`. `id` must exist in the store.
+///
+/// Switching projects no longer tears down the previous project's sessions —
+/// each session's agent already captured its own root/skills/memory at creation,
+/// so cross-project turns run in parallel and stay monitorable on the dashboard
+/// (#52). Deleting a project stops only *its* sessions (see `delete_project`).
+/// Build a project's ActiveProject bundle (root, skills, memory) by id, plus
+/// its (name, workspace) for callers that need them. Pure load — does not touch
+/// the per-window active slot.
+pub(super) async fn load_active_project(
+    state: &AppState,
+    id: &str,
+) -> Result<(ActiveProject, String, String), String> {
+    let (name, ws) = state
+        .store
+        .get_project(id)
+        .await
+        .map_err(|e| format!("{e}"))?
+        .ok_or_else(|| "Project not found".to_string())?;
+    let root = ensure_writable(PathBuf::from(&ws), &state.app_data);
+    let skills = Arc::new(crate::load_skill_index(&root));
+    let memory = Arc::new(MemoryManager::new(&root));
+    Ok((
+        ActiveProject {
+            id: id.to_string(),
+            root,
+            skills,
+            memory,
+        },
+        name,
+        ws,
+    ))
+}
+
+pub(super) async fn set_active_project(
+    state: &AppState,
+    label: &str,
+    id: &str,
+) -> Result<(String, String), String> {
+    // Only `open_research_assistant` binds the assistant's hidden project. As
+    // a workspace it would also become this window's project on next launch.
+    if wisp_store::is_assistant_project_id(id) {
+        return Err("The research assistant is not a project workspace.".into());
+    }
+    let recovery_projects = state
+        .store
+        .session_artifact_recovery_projects(id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !recovery_projects.is_empty() {
+        let _guards = recovery_projects
+            .iter()
+            .map(|project| state.begin_project_exclusive_activity(project))
+            .collect::<Result<Vec<_>, _>>()?;
+        state
+            .store
+            .recover_session_artifact_operations(id)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let _project_activity = state.begin_project_activity(id)?;
+    let (ap, name, ws) = load_active_project(state, id).await?;
+    let root = ap.root.clone();
+    state.set_active(label, ap);
+    state.set_active_frame(label, None);
+    // The window left the assistant for this project; nothing to restore.
+    state.assistant_windows.write().unwrap().remove(label);
+    remember_window_project(&state.store, label, id).await;
+    // Extra windows must not steal the main window's restore mapping or the
+    // startup workspace display. remember_window_project already skips home-*.
+    if label == "main" {
+        state.bootstrap.lock().unwrap().workspace = root.to_string_lossy().into_owned();
+        let _ = state.store.set_setting("active_project_id", id).await;
+    }
+    Ok((name, ws))
+}
+
+const WINDOW_ACTIVE_PROJECTS_KEY: &str = "window_active_projects";
+// Serialize only the small restore-setting read/modify/write operations.
+// Agent turns and project work never acquire this lock.
+static WINDOW_PERSISTENCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn load_window_active_projects(store: &Store) -> HashMap<String, String> {
+    store
+        .get_setting(WINDOW_ACTIVE_PROJECTS_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Persist this window's last project. File → New Window views (`home-*`) are
+/// not restored on launch, so they must not overwrite another window's mapping.
+/// Only the `main` window still writes the legacy `active_project_id` fallback.
+async fn remember_window_project(store: &Store, label: &str, id: &str) {
+    if crate::app_state::is_blank_window_label(label) {
+        return;
+    }
+    let _guard = WINDOW_PERSISTENCE_LOCK.lock().await;
+    let mut windows = load_window_active_projects(store).await;
+    windows.insert(label.to_string(), id.to_string());
+    let _ = store
+        .set_setting(
+            WINDOW_ACTIVE_PROJECTS_KEY,
+            &serde_json::to_string(&windows).unwrap_or_default(),
+        )
+        .await;
+}
+
+/// Project the `main` window should restore. Prefers `window_active_projects`
+/// so an extra window opening a different workspace cannot steal main's last
+/// project; falls back to the legacy global `active_project_id`.
+pub(crate) async fn startup_main_project_id(store: &Store) -> String {
+    let windows = load_window_active_projects(store).await;
+    // Builds before the `set_active_project` guard could persist the
+    // assistant's hidden project here; never start in it.
+    let restorable = |id: &str| !wisp_store::is_assistant_project_id(id);
+    if let Some(id) = windows.get("main").filter(|id| restorable(id)) {
+        if store.get_project(id).await.ok().flatten().is_some() {
+            return id.clone();
+        }
+    }
+    match store.get_setting("active_project_id").await.ok().flatten() {
+        Some(id) if restorable(&id) && store.get_project(&id).await.ok().flatten().is_some() => id,
+        _ => "default".to_string(),
+    }
+}
+
+/// Brand string used when no project is open (home, or a window that has not
+/// loaded a workspace yet). Taskbar, Alt-Tab, and the macOS title bar all
+/// read this, so it must stay in sync with the custom Windows titlebar.
+pub(super) const APP_WINDOW_TITLE: &str = "wisp science";
+
+/// Native window title: the app name, plus the project when one is open.
+pub(super) fn app_window_title(project_name: Option<&str>) -> String {
+    match project_name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("{APP_WINDOW_TITLE} \u{2014} {name}"),
+        None => APP_WINDOW_TITLE.to_string(),
+    }
+}
+
+fn apply_app_window_title(
+    window: &crate::workspace_surface::WorkspaceSurface,
+    project_name: Option<&str>,
+) {
+    let _ = window.set_title(&app_window_title(project_name));
+}
+
+#[tauri::command]
+pub(super) async fn open_project(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    id: String,
+) -> Result<ProjectSummary, String> {
+    super::project_sync::adopt_newer_folder_version(&state, &id).await;
+    let (name, ws) = set_active_project(state.inner(), window.label(), &id).await?;
+    apply_app_window_title(&window, Some(&name));
+    let _ = state.store.create_project(&id, &name, &ws).await; // touch updated_at → sorts to top
+    Ok(build_project_summary(&state, &id).await)
+}
+
+/// Project ids that currently have their own window, persisted so the set can be
+/// restored on the next launch (#52, Phase 3). Stored as a JSON array setting.
+pub(super) async fn persisted_windows(store: &Store) -> Vec<String> {
+    store
+        .get_setting("open_project_windows")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Preserve a dedicated window's label while restoring its last selected
+/// project, which may differ from the project that originally opened it.
+pub(super) async fn restored_window_projects(store: &Store) -> Vec<(String, String)> {
+    let windows = load_window_active_projects(store).await;
+    let mut restored = Vec::new();
+    for original_id in persisted_windows(store).await {
+        let label = project_window_label(&original_id);
+        let id = windows
+            .get(&label)
+            .filter(|id| !wisp_store::is_assistant_project_id(id))
+            .unwrap_or(&original_id);
+        if store.get_project(id).await.ok().flatten().is_some() {
+            restored.push((label, id.clone()));
+        } else if store
+            .get_project(&original_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            restored.push((label, original_id));
+        }
+    }
+    restored
+}
+
+pub(super) async fn update_persisted_windows(store: &Store, id: &str, present: bool) {
+    let _guard = WINDOW_PERSISTENCE_LOCK.lock().await;
+    let mut v = persisted_windows(store).await;
+    let had = v.iter().any(|x| x == id);
+    if present && !had {
+        v.push(id.to_string());
+    } else if !present && had {
+        v.retain(|x| x != id);
+    } else {
+        return;
+    }
+    let _ = store
+        .set_setting(
+            "open_project_windows",
+            &serde_json::to_string(&v).unwrap_or_default(),
+        )
+        .await;
+}
+
+pub(super) fn project_window_label(id: &str) -> String {
+    format!("proj-{id}") // project ids are UUIDs or "default" — label-safe
+}
+
+/// File → New Window: a fresh GUI that lands on the Projects home screen and
+/// is not bound to any workspace until the user opens one in that window.
+/// Labels must stay on the `home-*` glob in `capabilities/default.json`, or
+/// the custom Windows title-bar close/minimize/maximize calls are denied.
+pub(super) fn next_blank_window_label() -> String {
+    format!("home-{}", Uuid::new_v4())
+}
+
+pub(super) fn blank_window_url() -> &'static str {
+    "index.html"
+}
+
+/// Offset a new File → New Window from its anchor so the extra GUI is obvious
+/// instead of covering the caller exactly.
+pub(super) fn cascaded_window_position(anchor_pos: (i32, i32), offset: i32) -> (i32, i32) {
+    (anchor_pos.0 + offset, anchor_pos.1 + offset)
+}
+
+/// URL for a dedicated project window. Ids are UUIDs or "default" — no
+/// percent-encoding needed (matches `url_project_param` in the frontend).
+pub(super) fn project_window_url(id: &str, session: Option<&str>) -> String {
+    match session {
+        Some(sid) => format!("index.html?project={id}&session={sid}"),
+        None => format!("index.html?project={id}"),
+    }
+}
+
+/// Top-left position (physical px) that centers a window of `window_size`
+/// over an anchor window at `anchor_pos`/`anchor_size`. Pure so placement
+/// stays testable; the caller converts to logical coordinates.
+pub(super) fn centered_window_position(
+    anchor_pos: (i32, i32),
+    anchor_size: (u32, u32),
+    window_size: (u32, u32),
+) -> (i32, i32) {
+    (
+        anchor_pos.0 + (anchor_size.0 as i32 - window_size.0 as i32) / 2,
+        anchor_pos.1 + (anchor_size.1 as i32 - window_size.1 as i32) / 2,
+    )
+}
+
+/// Open a project in its own window (or focus the existing one), wiring up
+/// cleanup on close. Shared by the `open_project_window` command and the
+/// startup restore (#52). With `session`, the window opens straight into that
+/// session — an existing window is told via the `open-session` event (#423).
+/// `anchor_label` is the window the new one centers over; `None` (startup
+/// restore) falls back to the main window.
+pub(super) async fn spawn_project_window(
+    app: &AppHandle,
+    state: &AppState,
+    id: &str,
+    session: Option<&str>,
+    anchor_label: Option<&str>,
+) -> Result<String, String> {
+    // A dedicated window can switch projects. Look up its current binding
+    // before using a label that still names its original project.
+    let existing = state
+        .session_surface_labels("", Some(id))
+        .into_iter()
+        .find(|label| label.starts_with("proj-") && app.workspace_surface(label).is_some());
+    if let Some(w) = existing
+        .as_deref()
+        .and_then(|label| app.workspace_surface(label))
+    {
+        let label = w.label().to_string();
+        let _ = w.set_focus();
+        if let Some(sid) = session {
+            let _ = app.emit_to(
+                label.as_str(),
+                "open-session",
+                serde_json::json!({ "projectId": id, "sessionId": sid }),
+            );
+        }
+        return Ok(label);
+    }
+    let mut label = project_window_label(id);
+    if app.workspace_surface(&label).is_some() {
+        label = project_window_label(&Uuid::new_v4().to_string());
+    }
+    spawn_project_window_with_label(app, state, &label, id, session, anchor_label).await
+}
+
+pub(super) async fn spawn_project_window_with_label(
+    app: &AppHandle,
+    state: &AppState,
+    label: &str,
+    id: &str,
+    session: Option<&str>,
+    anchor_label: Option<&str>,
+) -> Result<String, String> {
+    let label = label.to_string();
+    // Pre-set this window's active project so its first commands resolve correctly
+    // even before the window's frontend calls open_project.
+    let (name, _) = set_active_project(state, &label, id).await?;
+    let url = tauri::WebviewUrl::App(project_window_url(id, session).into());
+    let mut builder = tauri::WebviewWindowBuilder::new(app, &label, url)
+        .title(app_window_title(Some(&name)))
+        .inner_size(1100.0, 760.0)
+        .resizable(true)
+        .general_autofill_enabled(false)
+        .on_navigation(crate::guard_webview_navigation);
+    // Center over the requesting window (or the main window on startup
+    // restore); otherwise the OS cascades each new window to an arbitrary
+    // spot. Sizes/positions are physical, so convert through the anchor's
+    // scale factor for the builder's logical `position`.
+    let anchor = anchor_label
+        .and_then(|label| app.workspace_surface(label))
+        .or_else(|| app.workspace_surface("main"));
+    if let Some(anchor) = anchor {
+        if let (Ok(pos), Ok(size)) = (anchor.outer_position(), anchor.outer_size()) {
+            let scale = anchor.scale_factor().unwrap_or(1.0);
+            let physical = ((1100.0 * scale) as u32, (760.0 * scale) as u32);
+            let (x, y) =
+                centered_window_position((pos.x, pos.y), (size.width, size.height), physical);
+            builder = builder.position(x as f64 / scale, y as f64 / scale);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    let builder = builder.decorations(false).shadow(true);
+    let win = builder.build().map_err(|e| e.to_string())?;
+    let win = crate::workspace_surface::WorkspaceSurface::from_webview(win.as_ref().clone())?;
+    crate::windows_snap::install_for_window(&win);
+    #[cfg(target_os = "macos")]
+    wire_macos_menu_events(&win);
+    let evt_app = app.clone();
+    let evt_label = label.clone();
+    let persisted_id = label.strip_prefix("proj-").unwrap_or(id).to_string();
+    let evt_id = persisted_id.clone();
+    win.on_window_event(move |ev| {
+        if matches!(ev, tauri::WindowEvent::Destroyed) {
+            // Drop this window's per-window project context and stop persisting
+            // it for restore. Its running sessions are tracked globally and keep
+            // going until they finish or are stopped.
+            let st = evt_app.state::<AppState>();
+            st.active.write().unwrap().remove(&evt_label);
+            st.active_frame.write().unwrap().remove(&evt_label);
+            let store = st.store.clone();
+            let id = evt_id.clone();
+            tauri::async_runtime::spawn(async move {
+                update_persisted_windows(&store, &id, false).await;
+            });
+        }
+    });
+    update_persisted_windows(&state.store, &persisted_id, true).await;
+    Ok(label)
+}
+
+/// Open a project in its own window (or focus the existing one). Each window
+/// carries its own active project, keyed by window label (#52).
+#[tauri::command]
+pub(super) async fn open_project_window(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    id: String,
+    session: Option<String>,
+) -> Result<String, String> {
+    spawn_project_window(
+        &app,
+        state.inner(),
+        &id,
+        session.as_deref(),
+        Some(window.label()),
+    )
+    .await
+}
+
+/// Open a blank GUI on the Projects home screen. The window has its own label
+/// and no `ActiveProject` until the user opens a workspace in it, so it cannot
+/// read or mutate another window's files, sessions, or runtimes.
+pub(super) async fn spawn_blank_window(
+    app: &AppHandle,
+    anchor_label: Option<&str>,
+) -> Result<String, String> {
+    let label = next_blank_window_label();
+    let url = tauri::WebviewUrl::App(blank_window_url().into());
+    let mut builder = tauri::WebviewWindowBuilder::new(app, &label, url)
+        .title(app_window_title(None))
+        .inner_size(1100.0, 760.0)
+        .resizable(true)
+        .general_autofill_enabled(false)
+        .on_navigation(crate::guard_webview_navigation);
+    let anchor = anchor_label
+        .and_then(|label| app.workspace_surface(label))
+        .or_else(|| app.workspace_surface("main"));
+    if let Some(anchor) = anchor {
+        if let Ok(pos) = anchor.outer_position() {
+            let scale = anchor.scale_factor().unwrap_or(1.0);
+            let offset = (36.0 * scale) as i32;
+            let (x, y) = cascaded_window_position((pos.x, pos.y), offset);
+            builder = builder.position(x as f64 / scale, y as f64 / scale);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    let builder = builder.decorations(false).shadow(true);
+    let win = builder.build().map_err(|e| e.to_string())?;
+    let win = crate::workspace_surface::WorkspaceSurface::from_webview(win.as_ref().clone())?;
+    crate::windows_snap::install_for_window(&win);
+    #[cfg(target_os = "macos")]
+    wire_macos_menu_events(&win);
+    let evt_app = app.clone();
+    let evt_label = label.clone();
+    win.on_window_event(move |ev| {
+        if matches!(ev, tauri::WindowEvent::Destroyed) {
+            let st = evt_app.state::<AppState>();
+            st.active.write().unwrap().remove(&evt_label);
+            st.active_frame.write().unwrap().remove(&evt_label);
+        }
+    });
+    Ok(label)
+}
+
+#[tauri::command]
+pub(super) async fn open_new_window(
+    app: AppHandle,
+    window: crate::workspace_surface::WorkspaceSurface,
+) -> Result<String, String> {
+    spawn_blank_window(&app, Some(window.label())).await
+}
+
+#[tauri::command]
+pub(super) async fn delete_project(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    id: String,
+    delete_data: Option<bool>,
+) -> Result<(), String> {
+    delete_project_record(
+        state.inner(),
+        &id,
+        delete_data.unwrap_or(false),
+        Some(window.label()),
+    )
+    .await
+}
+
+/// Shared deletion pipeline. Native callers supply an explicit project and no
+/// window; only existing window bindings to that project need a fallback.
+pub(crate) async fn delete_project_record(
+    state: &AppState,
+    id: &str,
+    delete_data: bool,
+    window_label: Option<&str>,
+) -> Result<(), String> {
+    validate_project_deletion(&state.store, id, delete_data).await?;
+    let project_activity = state.begin_project_activity(&id)?;
+    let workspace_delete_target = if delete_data {
+        let (_, workspace_dir) = state
+            .store
+            .get_project(&id)
+            .await
+            .map_err(|e| format!("{e}"))?
+            .ok_or_else(|| "Project not found".to_string())?;
+        project_workspace_delete_target(&workspace_dir)?
+    } else {
+        None
+    };
+    // The delete ✕ is only reachable from the projects list, so a project may
+    // legitimately be deleted while it's still the backend's *active* one
+    // (returning to the list is a frontend-only nav — it never told the backend
+    // to leave). Delete it, then fall back to the always-present "default"
+    // workspace so `active` never dangles at a deleted project. An unbound
+    // File → New Window (`home-*`) must not treat `main` as active or panic.
+    let fallback_windows: Vec<String> = match window_label {
+        Some(label) => state
+            .require_active(label)
+            .ok()
+            .filter(|ap| ap.id == id)
+            .map(|_| vec![label.to_owned()])
+            .unwrap_or_default(),
+        None => state
+            .active
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, project)| project.id == id)
+            .map(|(label, _)| label.clone())
+            .collect(),
+    };
+    // Stop the deleted project's own running sessions (gather frame ids before
+    // the store cascade removes them); other projects keep running (#52).
+    cancel_project_sessions(state, id).await;
+    state.browser_bridge.stop_project_workspace(&id).await;
+    state.runtime_manager.stop_project(&id).await;
+    if let Err(error) = state.run_manager.wind_down_project(&state.store, &id).await {
+        tracing::warn!(project_id = %id, "project wind-down failed: {error}");
+    }
+    drop(project_activity);
+    let _delete_activity = workspace_delete_target
+        .as_ref()
+        .map(|_| state.begin_project_exclusive_activity(id))
+        .transpose()?;
+    delete_project_storage(&state.store, id, workspace_delete_target).await?;
+    project_sync::forget_project_key(&id).await;
+    for label in fallback_windows {
+        // A window may have navigated elsewhere while the deletion was running.
+        if state
+            .require_active(&label)
+            .is_ok_and(|project| project.id == id)
+        {
+            let _ = set_active_project(state, &label, "default").await;
+        }
+    }
+    Ok(())
+}
+
+async fn delete_project_storage(
+    store: &Store,
+    id: &str,
+    target: Option<ProjectWorkspaceDeleteTarget>,
+) -> Result<(), String> {
+    let _database_deletion = store
+        .begin_project_database_deletion(id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(target) = target {
+        delete_project_workspace_data(target).await?;
+    }
+    store
+        .delete_project(id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn validate_project_deletion(
+    store: &Store,
+    id: &str,
+    delete_data: bool,
+) -> Result<(), String> {
+    // The files-preserving recovery action must work after a workspace is
+    // deleted or disconnected. Do not waive guards for destructive deletion
+    // or for other database errors (corruption, permissions, identity mismatch).
+    if !delete_data
+        && store
+            .project_database_is_missing(id)
+            .await
+            .map_err(|error| error.to_string())?
+    {
+        return Ok(());
+    }
+    exploration_commands::reject_private_exploration_project_mutation(store, id, "Project deletion")
+        .await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ProjectWorkspaceDeleteTarget {
+    Directory(PathBuf),
+    Symlink(PathBuf),
+}
+
+/// Resolve the registered project root before stopping any sessions. Missing
+/// workspaces are already effectively data-free, but broad filesystem roots
+/// are never valid deletion targets even after an explicit UI confirmation.
+pub(super) fn project_workspace_delete_target(
+    workspace_dir: &str,
+) -> Result<Option<ProjectWorkspaceDeleteTarget>, String> {
+    if workspace_dir.trim().is_empty() {
+        return Err("Project workspace is empty; refusing to delete data.".into());
+    }
+    let path = PathBuf::from(workspace_dir);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect project workspace {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(Some(ProjectWorkspaceDeleteTarget::Symlink(path)));
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "Project workspace is not a directory: {}",
+            path.display()
+        ));
+    }
+    let canonical = dunce::canonicalize(&path).map_err(|error| {
+        format!(
+            "Failed to inspect project workspace {}: {error}",
+            path.display()
+        )
+    })?;
+    if canonical.parent().is_none() {
+        return Err("Refusing to delete a filesystem root.".into());
+    }
+    Ok(Some(ProjectWorkspaceDeleteTarget::Directory(canonical)))
+}
+
+pub(super) async fn delete_project_workspace_data(
+    target: ProjectWorkspaceDeleteTarget,
+) -> Result<(), String> {
+    let display_path = match &target {
+        ProjectWorkspaceDeleteTarget::Directory(path)
+        | ProjectWorkspaceDeleteTarget::Symlink(path) => path.clone(),
+    };
+    let result = match target {
+        ProjectWorkspaceDeleteTarget::Directory(path) => tokio::fs::remove_dir_all(path).await,
+        ProjectWorkspaceDeleteTarget::Symlink(path) => {
+            #[cfg(target_os = "windows")]
+            {
+                tokio::fs::remove_dir(path).await
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                tokio::fs::remove_file(path).await
+            }
+        }
+    };
+    result.map_err(|error| {
+        format!(
+            "Failed to delete project data at {}: {error}",
+            display_path.display()
+        )
+    })
+}
+
+#[derive(Serialize, Clone)]
+pub(super) struct ProjectSettings {
+    id: String,
+    name: String,
+    description: String,
+    agent_context: String,
+    folder_sync: bool,
+}
+
+fn project_agent_context_path(root: &Path) -> PathBuf {
+    root.join(".wisp").join("WISP.md")
+}
+
+fn read_project_agent_context(root: &Path) -> String {
+    std::fs::read_to_string(project_agent_context_path(root)).unwrap_or_default()
+}
+
+fn write_project_agent_context(root: &Path, agent_context: &str) -> Result<(), String> {
+    let wisp_md = project_agent_context_path(root);
+    let ctx = agent_context.trim();
+    if ctx.is_empty() {
+        let _ = std::fs::remove_file(&wisp_md);
+        return Ok(());
+    }
+    if let Some(parent) = wisp_md.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to write Agent Context: {e}"))?;
+    }
+    std::fs::write(&wisp_md, ctx).map_err(|e| format!("Failed to write Agent Context: {e}"))
+}
+
+/// Resolve the project whose settings should be read or written. An explicit
+/// `id` (home-card configure) must not switch this window's active project.
+async fn settings_project(
+    state: &AppState,
+    window_label: &str,
+    requested_id: Option<&str>,
+) -> Result<(String, PathBuf, String, String), String> {
+    let id = match requested_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => id.to_string(),
+        None => state.require_active(window_label)?.id,
+    };
+    let (name, description, workspace) = state
+        .store
+        .get_project_meta(&id)
+        .await
+        .map_err(|e| format!("{e}"))?
+        .ok_or_else(|| "Project not found".to_string())?;
+    let root = ensure_writable(PathBuf::from(workspace), &state.app_data);
+    Ok((id, root, name, description))
+}
+
+/// Read a project's editable settings for the Project Settings modal.
+/// `id` targets a specific project (home-card configure). Omit it to use the
+/// window's active project. Agent Context is `.wisp/WISP.md`.
+#[tauri::command]
+pub(super) async fn get_project_settings(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    id: Option<String>,
+) -> Result<ProjectSettings, String> {
+    let (project_id, root, name, description) =
+        settings_project(state.inner(), window.label(), id.as_deref()).await?;
+    let _project_activity = state.begin_project_activity(&project_id)?;
+    let folder_sync = state
+        .store
+        .get_project_sync_state(&project_id)
+        .await
+        .map_err(|e| format!("{e}"))?
+        .is_some_and(|sync| sync.transport_kind == wisp_store::WORKSPACE_TRANSPORT);
+    Ok(ProjectSettings {
+        id: project_id,
+        name,
+        description,
+        agent_context: read_project_agent_context(&root),
+        folder_sync,
+    })
+}
+
+#[derive(Serialize, Clone)]
+pub(super) struct ProjectRunRetention {
+    run_retention_days: Option<i64>,
+    failed_run_retention_days: Option<i64>,
+    orphan_file_retention_days: Option<i64>,
+}
+
+/// Opt-in retention windows for automatic run-workspace cleanup and orphaned
+/// remote-file reclamation on servers.
+#[tauri::command]
+pub(super) async fn get_project_run_retention(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+) -> Result<ProjectRunRetention, String> {
+    let ap = state.require_active(window.label())?;
+    let (run_retention_days, failed_run_retention_days, orphan_file_retention_days) = state
+        .store
+        .project_run_retention(&ap.id)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    Ok(ProjectRunRetention {
+        run_retention_days,
+        failed_run_retention_days,
+        orphan_file_retention_days,
+    })
+}
+
+#[tauri::command]
+pub(super) async fn set_project_run_retention(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    run_retention_days: Option<i64>,
+    failed_run_retention_days: Option<i64>,
+    orphan_file_retention_days: Option<i64>,
+) -> Result<ProjectRunRetention, String> {
+    let ap = state.require_active(window.label())?;
+    let _project_activity = state.begin_project_activity(&ap.id)?;
+    state
+        .store
+        .set_project_run_retention(
+            &ap.id,
+            run_retention_days,
+            failed_run_retention_days,
+            orphan_file_retention_days,
+        )
+        .await
+        .map_err(|e| format!("{e}"))?;
+    Ok(ProjectRunRetention {
+        run_retention_days,
+        failed_run_retention_days,
+        orphan_file_retention_days,
+    })
+}
+
+/// Save a project's name/description (DB) and Agent Context (.wisp/WISP.md).
+/// `id` targets a specific project (home-card configure). Omit it to use the
+/// window's active project — this does not switch the active project.
+/// An empty Agent Context removes WISP.md so the prompt falls back to "no rules".
+/// Takes effect on the next seeded session; already-running agents keep their prompt.
+#[tauri::command]
+pub(super) async fn update_project(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    id: Option<String>,
+    name: String,
+    description: String,
+    agent_context: String,
+) -> Result<ProjectSummary, String> {
+    if name.trim().is_empty() {
+        return Err("Project name is required".into());
+    }
+    let (project_id, root, _, _) =
+        settings_project(state.inner(), window.label(), id.as_deref()).await?;
+    let _project_activity = state.begin_project_activity(&project_id)?;
+    exploration_commands::reject_private_exploration_project_mutation(
+        &state.store,
+        &project_id,
+        "Project settings changes",
+    )
+    .await?;
+    let name = name.trim();
+    state
+        .store
+        .update_project(&project_id, name, description.trim())
+        .await
+        .map_err(|e| format!("{e}"))?;
+    write_project_agent_context(&root, &agent_context)?;
+    // Home-card configure (`id` is Some) may run while this window is still
+    // on the projects landing — do not stamp that window with the renamed
+    // project. In-project settings omit `id` and should update this window.
+    // A dedicated window may now show a different project than its label.
+    if id.is_none() {
+        apply_app_window_title(&window, Some(name));
+    }
+    for label in state.session_surface_labels("", Some(&project_id)) {
+        if label.starts_with("proj-") {
+            if let Some(proj_win) = window.app_handle().workspace_surface(&label) {
+                apply_app_window_title(&proj_win, Some(name));
+            }
+        }
+    }
+    Ok(build_project_summary(&state, &project_id).await)
+}
+
+#[tauri::command]
+pub(super) async fn get_project_info(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+) -> Result<ProjectInfo, String> {
+    build_project_info(&state, window.label()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::exploration_commands::ExplorationService;
+    use std::path::Path;
+    use wisp_store::Store;
+
+    use super::{
+        app_window_title, blank_window_url, cascaded_window_position, load_window_active_projects,
+        next_blank_window_label, read_project_agent_context, remember_window_project,
+        restored_window_projects, same_workspace_path, startup_main_project_id,
+        update_persisted_windows, validate_project_deletion, write_project_agent_context,
+        APP_WINDOW_TITLE,
+    };
+
+    #[tokio::test]
+    async fn project_storage_deletion_releases_open_database_before_removing_files() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_application(&root.path().join("global.sqlite"))
+            .await
+            .unwrap();
+        store
+            .set_setting("decentralized_project_storage", "true")
+            .await
+            .unwrap();
+        let workspace = root.path().join("project");
+        store
+            .create_project("p", "P", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        store
+            .create_frame("f", "p", "agent", "model")
+            .await
+            .unwrap();
+        std::fs::write(workspace.join("research.txt"), "data").unwrap();
+        let target = super::project_workspace_delete_target(workspace.to_str().unwrap()).unwrap();
+        super::delete_project_storage(&store, "p", target)
+            .await
+            .unwrap();
+        assert!(!workspace.exists());
+        assert!(store.get_project("p").await.unwrap().is_none());
+        assert!(store.list_projects().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_storage_deletion_failure_keeps_registration_and_can_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_application(&root.path().join("global.sqlite"))
+            .await
+            .unwrap();
+        store
+            .set_setting("decentralized_project_storage", "true")
+            .await
+            .unwrap();
+        let workspace = root.path().join("project");
+        store
+            .create_project("p", "P", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        store
+            .create_frame("f", "p", "agent", "model")
+            .await
+            .unwrap();
+        let user_file = workspace.join("research.txt");
+        std::fs::write(&user_file, "keep data").unwrap();
+        let invalid = super::ProjectWorkspaceDeleteTarget::Directory(user_file.join("child"));
+        let error = super::delete_project_storage(&store, "p", Some(invalid))
+            .await
+            .unwrap_err();
+        assert!(error.contains("Failed to delete project data"), "{error}");
+        assert!(store.get_project("p").await.unwrap().is_some());
+        assert_eq!(std::fs::read_to_string(&user_file).unwrap(), "keep data");
+        let target = super::project_workspace_delete_target(workspace.to_str().unwrap()).unwrap();
+        super::delete_project_storage(&store, "p", target)
+            .await
+            .unwrap();
+        assert!(!workspace.exists());
+        assert!(store.list_projects().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_project_database_can_be_removed_without_deleting_files() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_application(&root.path().join("global.sqlite"))
+            .await
+            .unwrap();
+        store
+            .create_project(
+                "healthy",
+                "Healthy",
+                root.path().join("healthy").to_str().unwrap(),
+            )
+            .await
+            .unwrap();
+        store
+            .create_frame("session", "healthy", "agent", "model")
+            .await
+            .unwrap();
+        store
+            .append_message("session", 1, &wisp_llm::Message::user("keep history"))
+            .await
+            .unwrap();
+        store
+            .set_setting("decentralized_project_storage", "true")
+            .await
+            .unwrap();
+        let workspace = root.path().join("offline");
+        store
+            .create_project("offline", "Offline", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        // Creation closes the new project's pool before publishing its location.
+        let database = workspace.join(wisp_store::PROJECT_DATABASE);
+        let saved = root.path().join("saved.sqlite");
+        std::fs::rename(&database, &saved).unwrap();
+        let saved_bytes = std::fs::read(&saved).unwrap();
+        let user_file = workspace.join("research.txt");
+        std::fs::write(&user_file, "keep data").unwrap();
+
+        assert!(validate_project_deletion(&store, "offline", true)
+            .await
+            .unwrap_err()
+            .contains("unavailable"));
+        validate_project_deletion(&store, "offline", false)
+            .await
+            .unwrap();
+        store.delete_project("offline").await.unwrap();
+        assert!(store.get_project("offline").await.unwrap().is_none());
+        assert_eq!(store.list_projects().await.unwrap().len(), 1);
+        assert_eq!(
+            store.load_messages("session").await.unwrap()[0]
+                .content
+                .as_text(),
+            "keep history"
+        );
+        assert_eq!(std::fs::read(&saved).unwrap(), saved_bytes);
+        assert_eq!(std::fs::read_to_string(&user_file).unwrap(), "keep data");
+        assert!(!database.exists());
+    }
+
+    /// A damaged database is never treated as a missing one. Opening it sets
+    /// the damaged file aside and rebuilds the database (#1610), and that is
+    /// what the user is told; only the rebuilt database passes the checks.
+    #[tokio::test]
+    async fn project_deletion_does_not_ignore_corrupt_registered_databases() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_application(&root.path().join("global.sqlite"))
+            .await
+            .unwrap();
+        store
+            .set_setting("decentralized_project_storage", "true")
+            .await
+            .unwrap();
+        let workspace = root.path().join("project");
+        store
+            .create_project("p", "P", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        let database = workspace.join(wisp_store::PROJECT_DATABASE);
+        std::fs::write(&database, b"not a SQLite database").unwrap();
+        let error = validate_project_deletion(&store, "p", true)
+            .await
+            .unwrap_err();
+        assert!(error.contains("project_database_rebuilt:"), "{error}");
+        let damaged: Vec<std::path::PathBuf> = std::fs::read_dir(database.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert_eq!(damaged.len(), 1, "{damaged:?}");
+        assert_eq!(
+            std::fs::read(&damaged[0]).unwrap(),
+            b"not a SQLite database"
+        );
+        for delete_data in [false, true] {
+            validate_project_deletion(&store, "p", delete_data)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn project_deletion_still_blocks_unresolved_explorations() {
+        for decentralized in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Store::open_application(&root.path().join("global.sqlite"))
+                .await
+                .unwrap();
+            store
+                .set_setting("decentralized_project_storage", &decentralized.to_string())
+                .await
+                .unwrap();
+            let workspace = root.path().join("project");
+            store
+                .create_project("p", "P", workspace.to_str().unwrap())
+                .await
+                .unwrap();
+            for delete_data in [false, true] {
+                validate_project_deletion(&store, "p", delete_data)
+                    .await
+                    .unwrap();
+            }
+            store
+                .create_frame("main", "p", "agent", "model")
+                .await
+                .unwrap();
+            store
+                .append_message("main", 1, &wisp_llm::Message::user("question"))
+                .await
+                .unwrap();
+            store
+                .append_message("main", 2, &wisp_llm::Message::assistant("answer"))
+                .await
+                .unwrap();
+            let service = ExplorationService::new(store.clone(), root.path().join("app-data"));
+            let checkpoint = service.create_checkpoint("p", "main").await.unwrap();
+            service
+                .create_exploration(&checkpoint.id, "Candidate")
+                .await
+                .unwrap();
+            for delete_data in [false, true] {
+                assert!(validate_project_deletion(&store, "p", delete_data)
+                    .await
+                    .unwrap_err()
+                    .contains("exploration_project_mutation_blocked"));
+            }
+        }
+    }
+
+    #[test]
+    fn app_window_title_uses_the_project_name() {
+        assert_eq!(app_window_title(None), APP_WINDOW_TITLE);
+        assert_eq!(app_window_title(Some("")), APP_WINDOW_TITLE);
+        assert_eq!(app_window_title(Some("   ")), APP_WINDOW_TITLE);
+        assert_eq!(
+            app_window_title(Some("fkbp1a-aortic-ring-assay")),
+            "wisp science \u{2014} fkbp1a-aortic-ring-assay"
+        );
+        assert_eq!(
+            app_window_title(Some("  fkbp1a  ")),
+            "wisp science \u{2014} fkbp1a"
+        );
+    }
+
+    #[test]
+    fn blank_window_url_does_not_bind_a_project() {
+        assert_eq!(blank_window_url(), "index.html");
+        assert!(!blank_window_url().contains("project="));
+        let label = next_blank_window_label();
+        assert!(crate::app_state::is_blank_window_label(&label));
+        assert_ne!(label, next_blank_window_label());
+    }
+
+    #[test]
+    fn cascaded_window_position_offsets_from_the_anchor() {
+        assert_eq!(cascaded_window_position((100, 50), 36), (136, 86));
+        assert_eq!(cascaded_window_position((-1600, -50), 36), (-1564, -14));
+    }
+
+    #[test]
+    fn workspace_path_match_resolves_equivalent_existing_paths() {
+        let root =
+            std::env::temp_dir().join(format!("wisp_same_workspace_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert!(same_workspace_path(&root, &root.join(".")));
+        assert!(!same_workspace_path(&root, &root.join("other")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_lookup_keeps_every_identity_and_its_session_count() {
+        let root =
+            std::env::temp_dir().join(format!("wisp_workspace_ids_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let summary = |id: &str, path: &Path, count: i64| super::ProjectSummary {
+            starred: false,
+            id: id.into(),
+            name: "Same name".into(),
+            description: String::new(),
+            workspace_dir: path.to_string_lossy().into_owned(),
+            session_count: count,
+            artifact_count: 0,
+            updated_at: 1,
+            running_count: 0,
+            needs_you_count: 0,
+            sync_configured: false,
+            last_synced_at: None,
+            folder_sync: None,
+        };
+        let projects = vec![
+            summary("P37", &root, 9),
+            summary("P15", &root.join("."), 31),
+            summary("P14", &root, 2),
+            summary("P19", &root, 3),
+            summary("unrelated", &root.join("other"), 100),
+        ];
+        let matches = super::matching_workspace_projects(projects, &root);
+        assert_eq!(
+            matches
+                .iter()
+                .map(|p| (p.id.as_str(), p.session_count))
+                .collect::<Vec<_>>(),
+            vec![("P37", 9), ("P15", 31), ("P14", 2), ("P19", 3)]
+        );
+        // The new command reuses the shared UI contract, including full ids.
+        let ui: Vec<wisp_dto::ProjectSummary> =
+            serde_json::from_value(serde_json::to_value(&matches).unwrap()).unwrap();
+        assert_eq!(ui[1].id, "P15");
+        assert_eq!(ui[1].session_count, 31);
+        assert!(super::matching_workspace_projects(matches, &root.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_lookup_resolves_symlink_aliases() {
+        let root =
+            std::env::temp_dir().join(format!("wisp_workspace_alias_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("original")).unwrap();
+        std::os::unix::fs::symlink(root.join("original"), root.join("alias")).unwrap();
+        assert!(same_workspace_path(
+            &root.join("original"),
+            &root.join("alias")
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_lookup_resolves_windows_case_and_separators() {
+        let root =
+            std::env::temp_dir().join(format!("wisp_workspace_case_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let variant = format!(
+            "{}/",
+            root.to_string_lossy()
+                .to_ascii_uppercase()
+                .replace('\\', "/")
+        );
+        assert!(same_workspace_path(&root, Path::new(&variant)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn restart_keeps_selected_identity_when_workspace_has_duplicate_projects() {
+        let root = std::env::temp_dir().join(format!("wisp_restore_ids_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("test.sqlite");
+        let store = wisp_store::Store::open(&database).await.unwrap();
+        for id in ["P15", "P14", "P19", "P37"] {
+            store
+                .create_project(id, "Same name", &root.to_string_lossy())
+                .await
+                .unwrap();
+        }
+        store.set_setting("active_project_id", "P37").await.unwrap();
+        remember_window_project(&store, "main", "P15").await;
+        drop(store);
+        let store = wisp_store::Store::open(&database).await.unwrap();
+        assert_eq!(startup_main_project_id(&store).await, "P15");
+        assert_eq!(store.list_projects().await.unwrap().len(), 4);
+        assert_eq!(
+            store
+                .get_setting("active_project_id")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("P37")
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_context_writes_wisp_md_and_empty_clears_it() {
+        let root = std::env::temp_dir().join(format!(
+            "wisp_project_settings_ctx_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        write_project_agent_context(&root, "  Prefer the project UI setting.  ").unwrap();
+        assert_eq!(
+            read_project_agent_context(&root),
+            "Prefer the project UI setting."
+        );
+        write_project_agent_context(&root, "   ").unwrap();
+        assert!(read_project_agent_context(&root).is_empty());
+        assert!(!root.join(".wisp").join("WISP.md").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn extra_windows_do_not_overwrite_main_last_project() {
+        let path = std::env::temp_dir().join(format!(
+            "wisp_window_projects_{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = wisp_store::Store::open(&path).await.unwrap();
+        store
+            .create_project("main-project", "Main", "/ws/main")
+            .await
+            .unwrap();
+        store
+            .create_project("other-project", "Other", "/ws/other")
+            .await
+            .unwrap();
+        let _ = store
+            .set_setting("active_project_id", "main-project")
+            .await
+            .unwrap();
+
+        tokio::join!(
+            remember_window_project(&store, "main", "main-project"),
+            remember_window_project(&store, "home-abc", "other-project"),
+            remember_window_project(&store, "proj-other-project", "other-project"),
+        );
+
+        let windows = load_window_active_projects(&store).await;
+        assert_eq!(
+            windows.get("main").map(String::as_str),
+            Some("main-project")
+        );
+        assert_eq!(
+            windows.get("proj-other-project").map(String::as_str),
+            Some("other-project")
+        );
+        assert!(
+            !windows.contains_key("home-abc"),
+            "blank File → New Window labels must not persist: {windows:?}"
+        );
+        assert_eq!(startup_main_project_id(&store).await, "main-project");
+
+        let _ = store
+            .set_setting("active_project_id", "other-project")
+            .await
+            .unwrap();
+        assert_eq!(
+            startup_main_project_id(&store).await,
+            "main-project",
+            "window_active_projects[main] must beat the legacy global id"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn dedicated_windows_restore_switched_projects_after_concurrent_updates() {
+        let path = std::env::temp_dir().join(format!(
+            "wisp_window_restore_{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = wisp_store::Store::open(&path).await.unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .create_project(id, id, &format!("/ws/{id}"))
+                .await
+                .unwrap();
+        }
+        tokio::join!(
+            update_persisted_windows(&store, "a", true),
+            update_persisted_windows(&store, "b", true),
+        );
+        remember_window_project(&store, "proj-a", "c").await;
+        let mut restored = restored_window_projects(&store).await;
+        restored.sort();
+        assert_eq!(
+            restored,
+            vec![("proj-a".into(), "c".into()), ("proj-b".into(), "b".into())]
+        );
+
+        // A deleted last project falls back to the original, and closing one
+        // window must not discard a concurrently opened sibling.
+        store.delete_project("c").await.unwrap();
+        assert!(restored_window_projects(&store)
+            .await
+            .contains(&("proj-a".into(), "a".into())));
+        tokio::join!(
+            update_persisted_windows(&store, "a", false),
+            update_persisted_windows(&store, "new-label", true),
+        );
+        remember_window_project(&store, "proj-new-label", "b").await;
+        let mut restored = restored_window_projects(&store).await;
+        restored.sort();
+        assert_eq!(
+            restored,
+            vec![
+                ("proj-b".into(), "b".into()),
+                ("proj-new-label".into(), "b".into())
+            ]
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn startup_main_project_id_falls_back_to_legacy_then_default() {
+        let path = std::env::temp_dir().join(format!(
+            "wisp_startup_main_project_{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = wisp_store::Store::open(&path).await.unwrap();
+        store
+            .create_project("legacy-project", "Legacy", "/ws/legacy")
+            .await
+            .unwrap();
+        store
+            .create_project("gone-project", "Gone", "/ws/gone")
+            .await
+            .unwrap();
+
+        assert_eq!(startup_main_project_id(&store).await, "default");
+
+        let _ = store
+            .set_setting("active_project_id", "legacy-project")
+            .await
+            .unwrap();
+        assert_eq!(startup_main_project_id(&store).await, "legacy-project");
+
+        remember_window_project(&store, "main", "gone-project").await;
+        store.delete_project("gone-project").await.unwrap();
+        assert_eq!(
+            startup_main_project_id(&store).await,
+            "legacy-project",
+            "stale window_active_projects[main] must fall back to the legacy id"
+        );
+
+        let _ = store
+            .set_setting("active_project_id", "missing")
+            .await
+            .unwrap();
+        assert_eq!(startup_main_project_id(&store).await, "default");
+
+        // An earlier build could persist the assistant's hidden project as
+        // main's workspace; it is never restored.
+        let assistant = wisp_store::ASSISTANT_PROJECT_ID;
+        store
+            .create_project(assistant, "Assistant", "")
+            .await
+            .unwrap();
+        remember_window_project(&store, "main", assistant).await;
+        let _ = store
+            .set_setting("active_project_id", assistant)
+            .await
+            .unwrap();
+        assert_eq!(startup_main_project_id(&store).await, "default");
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+}

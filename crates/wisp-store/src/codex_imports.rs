@@ -1,0 +1,190 @@
+//! Mapping between imported Codex CLI rollouts and Wisp frames (#464).
+//! Keyed by the Codex thread id so re-imports are idempotent. Deliberately
+//! not `acp_sessions`: that binding routes a frame's sends through the ACP
+//! runtime and blocks rewind, which must not happen to imported transcripts.
+
+use super::context_epochs::HEAD_EPOCH_ROWS;
+use super::Store;
+use anyhow::Result;
+use std::collections::HashMap;
+
+impl Store {
+    /// The frame a Codex rollout was already imported into, if any.
+    pub async fn find_codex_import(&self, codex_session_id: &str) -> Result<Option<String>> {
+        if let Some(store) = self
+            .route_entity("codex_imports", "codex_session_id", codex_session_id)
+            .await?
+        {
+            return Box::pin(store.find_codex_import(codex_session_id)).await;
+        }
+        Ok(
+            sqlx::query_scalar("SELECT frame_id FROM codex_imports WHERE codex_session_id=?")
+                .bind(codex_session_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Rollouts imported into `project_id`, by import key: the frame and its
+    /// model-visible message count. One query for a whole import listing
+    /// instead of routed lookups per listed rollout.
+    pub async fn codex_imports_in_project(
+        &self,
+        project_id: &str,
+    ) -> Result<HashMap<String, (String, i64)>> {
+        if let Some(store) = self.route_project(project_id).await? {
+            return Box::pin(store.codex_imports_in_project(project_id)).await;
+        }
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(&format!(
+            "SELECT ci.codex_session_id, ci.frame_id, \
+             (SELECT COUNT(*) FROM messages m WHERE m.frame_id=ci.frame_id AND {HEAD_EPOCH_ROWS}) \
+             FROM codex_imports ci JOIN frames fr ON fr.id=ci.frame_id WHERE fr.project_id=?"
+        ))
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(key, frame, count)| (key, (frame, count)))
+            .collect())
+    }
+
+    /// Record (or refresh) the rollout → frame mapping after an import.
+    pub async fn record_codex_import(
+        &self,
+        codex_session_id: &str,
+        frame_id: &str,
+        source_path: &str,
+    ) -> Result<()> {
+        if let Some(store) = self.route_entity("frames", "id", frame_id).await? {
+            return Box::pin(store.record_codex_import(codex_session_id, frame_id, source_path))
+                .await;
+        }
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO codex_imports(codex_session_id,frame_id,source_path,created_at,updated_at) \
+             VALUES(?,?,?,?,?) \
+             ON CONFLICT(codex_session_id) DO UPDATE SET \
+             frame_id=excluded.frame_id, source_path=excluded.source_path, \
+             updated_at=excluded.updated_at",
+        )
+        .bind(codex_session_id)
+        .bind(frame_id)
+        .bind(source_path)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CODEX_IMPORTS_MIGRATION;
+
+    async fn store_with_frame() -> (Store, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "wisp_store_codex_imports_{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&path).await.unwrap();
+        store
+            .create_project("p", "Project", "/workspace")
+            .await
+            .unwrap();
+        store.create_frame("f1", "p", "Codex", "m").await.unwrap();
+        (store, path)
+    }
+
+    #[tokio::test]
+    async fn codex_import_round_trips_and_cascades_on_delete() {
+        let (store, path) = store_with_frame().await;
+        assert_eq!(store.find_codex_import("codex-1").await.unwrap(), None);
+        store
+            .record_codex_import("codex-1", "f1", "/tmp/rollout.jsonl")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.find_codex_import("codex-1").await.unwrap(),
+            Some("f1".to_string())
+        );
+        // Upsert keeps a single row per Codex thread.
+        store
+            .record_codex_import("codex-1", "f1", "/tmp/rollout2.jsonl")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.find_codex_import("codex-1").await.unwrap(),
+            Some("f1".to_string())
+        );
+
+        // Deleting the Wisp session frees the Codex id for re-import.
+        store.delete_session("f1", "p").await.unwrap();
+        assert_eq!(store.find_codex_import("codex-1").await.unwrap(), None);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn project_listing_returns_only_that_projects_imports_with_counts() {
+        let (store, path) = store_with_frame().await;
+        store.create_project("q", "Other", "/other").await.unwrap();
+        store.create_frame("f2", "q", "Codex", "m").await.unwrap();
+        store
+            .append_message("f1", 1, &wisp_llm::Message::user("hi"))
+            .await
+            .unwrap();
+        store
+            .append_message("f1", 2, &wisp_llm::Message::assistant("hello"))
+            .await
+            .unwrap();
+        store
+            .record_codex_import("codex-1", "f1", "/a")
+            .await
+            .unwrap();
+        store
+            .record_codex_import("codex-2", "f2", "/b")
+            .await
+            .unwrap();
+
+        let imports = store.codex_imports_in_project("p").await.unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports["codex-1"], ("f1".to_string(), 2));
+        assert_eq!(
+            imports["codex-1"].1,
+            store.message_count("f1").await.unwrap()
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn codex_imports_migration_is_idempotent() {
+        let (store, path) = store_with_frame().await;
+        store
+            .record_codex_import("codex-1", "f1", "/tmp/rollout.jsonl")
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM wisp_schema_migrations WHERE version=?")
+            .bind(CODEX_IMPORTS_MIGRATION)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(&path).await.unwrap();
+        assert_eq!(
+            reopened.find_codex_import("codex-1").await.unwrap(),
+            Some("f1".to_string())
+        );
+        assert!(reopened
+            .schema_migrations()
+            .await
+            .unwrap()
+            .contains(&CODEX_IMPORTS_MIGRATION.to_string()));
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+}

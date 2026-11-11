@@ -1,0 +1,1669 @@
+//! Contract tests for the invoke/event boundary: backend payloads must
+//! deserialize into the shared UI DTOs in `crates/wisp-dto`. The UI cannot
+//! link native crates (wasm32), so its DTOs mirror backend shapes by hand;
+//! these tests turn silent serde drift into a compile-time/test failure.
+//!
+//! Pattern: build the backend value → `serde_json::to_value` (what tauri IPC
+//! sends) → deserialize into the `wisp_dto` type → assert field fidelity.
+
+use serde_json::json;
+
+#[tokio::test]
+async fn reviewer_probe_uses_only_the_selected_projects_session_binding() {
+    let store = wisp_store::Store::open(std::path::Path::new(":memory:"))
+        .await
+        .unwrap();
+    store.create_project("a", "A", "").await.unwrap();
+    store.create_project("b", "B", "").await.unwrap();
+    store
+        .create_frame("s", "a", "OPERON", "model")
+        .await
+        .unwrap();
+    store
+        .save_acp_session(&wisp_store::AcpSessionBinding {
+            frame_id: "s".into(),
+            agent_profile_id: "session-agent".into(),
+            profile_fingerprint: "fake".into(),
+            agent_session_id: "remote-session".into(),
+            cwd: "".into(),
+            protocol_version: 1,
+            agent_info_json: "{}".into(),
+            capabilities_json: "{}".into(),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::reviewer_test_session_profile(&store, "a", Some("s"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("session-agent")
+    );
+    assert_eq!(
+        crate::reviewer_test_session_profile(&store, "a", None)
+            .await
+            .unwrap(),
+        None
+    );
+    for (project, session) in [("b", "s"), ("a", "missing"), ("a", "")] {
+        assert!(
+            crate::reviewer_test_session_profile(&store, project, Some(session))
+                .await
+                .is_err()
+        );
+    }
+    let result = wisp_dto::ReviewerBackendTestResult {
+        backend: "acp_agent".into(),
+        model: "session-agent".into(),
+        status: "needs_correction".into(),
+        summary: "Check evidence".into(),
+    };
+    assert_eq!(
+        serde_json::from_value::<wisp_dto::ReviewerBackendTestResult>(
+            serde_json::to_value(&result).unwrap()
+        )
+        .unwrap(),
+        result
+    );
+}
+
+#[test]
+fn project_chat_search_preserves_literal_snippets_and_paging_locator() {
+    let wire = json!({
+        "items": [{
+            "session_id": "saved-session", "session_title": "分析记录", "message_seq": 42,
+            "role": "assistant", "ts": 100,
+            "before": "…<script>", "matched": "中文 100%_", "after": "</script>\nnext…"
+        }],
+        "next_cursor": {"ts": 100, "session_id": "saved-session", "message_seq": 42}
+    });
+    let page: wisp_dto::ProjectChatSearchPage = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(
+        page.items[0].message_seq,
+        page.next_cursor.as_ref().unwrap().message_seq
+    );
+    assert_eq!(serde_json::to_value(page).unwrap(), wire);
+    let target = wisp_dto::ProjectChatSearchTarget {
+        user_index: 7,
+        before_seq: Some(90),
+    };
+    let decoded: wisp_dto::ProjectChatSearchTarget = roundtrip(&target);
+    assert_eq!(decoded, target);
+}
+
+#[test]
+fn swarm_presentation_retains_per_task_failure_and_run_identity() {
+    use wisp_dto::{SwarmPhase, SwarmProgress, SwarmTask, SwarmTaskStatus};
+    let mut task = SwarmTask::queued(
+        "paper-1".into(),
+        "Paper 1".into(),
+        "Extract methods".into(),
+        1,
+    );
+    task.status = SwarmTaskStatus::Failed;
+    task.log.push("Could not read input".into());
+    let progress = SwarmProgress {
+        id: "run-1".into(),
+        source: "map_items".into(),
+        title: "Methods".into(),
+        model: "fake".into(),
+        started_at_ms: 20,
+        revision: 8,
+        phase: SwarmPhase::Partial,
+        total: 1,
+        tasks: vec![task],
+        summary: "1 failed".into(),
+    };
+    let event = crate::swarm_progress::progress_event("frame-1", &progress);
+    let wire = serde_json::to_value(event).unwrap();
+    let wisp_dto::AgentEvent::ToolPresentation {
+        frame_id,
+        presentation_kind,
+        payload,
+        ..
+    } = serde_json::from_value::<wisp_dto::AgentEvent>(wire).unwrap()
+    else {
+        panic!("wrong event kind")
+    };
+    assert_eq!(frame_id, "frame-1");
+    assert_eq!(presentation_kind, wisp_dto::SWARM_PRESENTATION);
+    assert_eq!(
+        serde_json::from_value::<SwarmProgress>(payload).unwrap(),
+        progress
+    );
+}
+
+#[test]
+fn native_workflow_canvas_fixture_preserves_all_task_metadata() {
+    let wire: serde_json::Value = serde_json::from_str(include_str!(
+        "../../contracts/native-workflows/v1/template.json"
+    ))
+    .unwrap();
+    let backend: crate::quick_actions::WorkflowTemplate =
+        serde_json::from_value(wire.clone()).unwrap();
+    crate::dynamic_workflow::validate_proposal(&backend.proposal).unwrap();
+    let dto: wisp_dto::WorkflowTemplate = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(dto).unwrap(), wire);
+    assert_eq!(serde_json::to_value(backend).unwrap(), wire);
+}
+
+#[test]
+fn local_file_upload_result_preserves_success_and_failure() {
+    let wire = json!([
+        {"source": "C:\\data\\input.csv", "path": "docs/input_1.csv", "error": null},
+        {"source": "/missing.csv", "path": null, "error": "File not found"}
+    ]);
+    let results: Vec<wisp_dto::LocalFileUploadResult> =
+        serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(results[0].path.as_deref(), Some("docs/input_1.csv"));
+    assert_eq!(results[1].error.as_deref(), Some("File not found"));
+    assert_eq!(serde_json::to_value(results).unwrap(), wire);
+}
+
+#[test]
+fn workspace_path_classification_distinguishes_directories_and_unavailable_entries() {
+    use wisp_dto::WorkspacePathKind;
+    let wire = json!({"report.md": "file", "docs/annotation": "directory", "gone": "unavailable"});
+    let kinds: std::collections::HashMap<String, WorkspacePathKind> =
+        serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(kinds["docs/annotation"], WorkspacePathKind::Directory);
+    assert_eq!(kinds["gone"], WorkspacePathKind::Unavailable);
+    assert_eq!(serde_json::to_value(kinds).unwrap(), wire);
+}
+
+#[test]
+fn workflow_conversion_progress_preserves_request_identity_and_stage() {
+    use wisp_dto::{WorkflowConversionProgress, WorkflowConversionStage};
+    let progress = WorkflowConversionProgress {
+        conversion_id: "conversion-window-a-1".into(),
+        stage: WorkflowConversionStage::Repairing,
+    };
+    let wire = serde_json::to_value(&progress).unwrap();
+    assert_eq!(
+        wire,
+        json!({"conversion_id":"conversion-window-a-1", "stage":"repairing"})
+    );
+    assert_eq!(
+        serde_json::from_value::<WorkflowConversionProgress>(wire).unwrap(),
+        progress
+    );
+}
+
+#[test]
+fn mcp_app_isolation_dtos_keep_js_camel_case_and_page_generation() {
+    let handle = wisp_dto::McpAppChildHandle {
+        owner_epoch: "page-1".into(),
+        mount_serial: 4,
+        child_label: "mcp-app-child-test".into(),
+    };
+    let value = serde_json::to_value(&handle).unwrap();
+    assert_eq!(
+        value,
+        json!({"ownerEpoch":"page-1","mountSerial":4,"childLabel":"mcp-app-child-test"})
+    );
+    let bounds: wisp_dto::McpAppChildBounds = serde_json::from_value(json!({"x":10,"y":20,"width":300,"height":200,"viewportWidth":1000,"viewportHeight":700,"visible":false,"revision":3})).unwrap();
+    assert_eq!(bounds.revision, 3);
+    let bootstrap = wisp_dto::McpAppChildBootstrap {
+        handle,
+        instance_id: "mcp-app:session:ui://test".into(),
+        payload: json!({"resource":{"text":"<body>"}}),
+        host_context: json!({"theme":"light"}),
+        version: "test".into(),
+        server_tools_available: false,
+    };
+    let decoded: wisp_dto::McpAppChildBootstrap = roundtrip(&bootstrap);
+    assert_eq!(decoded.handle.mount_serial, 4);
+    assert_eq!(decoded.host_context["theme"], "light");
+    let request: wisp_dto::McpAppChildRequest = serde_json::from_value(
+        json!({"id":null,"method":"ui/notifications/initialized","params":{}}),
+    )
+    .unwrap();
+    assert!(request.id.is_none());
+    assert_eq!(
+        serde_json::to_value(wisp_dto::McpAppChildCloseReason::UserClose).unwrap(),
+        "user_close"
+    );
+}
+
+/// The `toolchain-install` event and `get_toolchain_status` reply. The idle
+/// form omits progress fields; a running one keeps step, label, and log.
+#[test]
+fn toolchain_status_keeps_progress_and_accepts_the_idle_form() {
+    let idle: wisp_dto::ToolchainStatus = serde_json::from_value(json!({
+        "root": "/data/toolchain", "installed": ["r"], "state": "idle"
+    }))
+    .unwrap();
+    assert_eq!(idle.installed, ["r"]);
+    assert!(idle.log.is_empty() && idle.error.is_none() && idle.step == 0);
+    let running = wisp_dto::ToolchainStatus {
+        root: "/data/toolchain".into(),
+        installed: vec!["uv".into()],
+        state: "running".into(),
+        tools: vec!["uv".into(), "python".into()],
+        step: 3,
+        total: 6,
+        label: "install:python".into(),
+        log: vec!["$ pixi global install --environment python python=3.12".into()],
+        error: None,
+    };
+    let wire = serde_json::to_value(&running).unwrap();
+    for key in [
+        "root",
+        "installed",
+        "state",
+        "tools",
+        "step",
+        "total",
+        "label",
+        "log",
+        "error",
+    ] {
+        assert!(wire.get(key).is_some(), "{key} missing from {wire}");
+    }
+    let ui: wisp_dto::ToolchainStatus = roundtrip(&running);
+    assert_eq!(ui, running);
+}
+
+#[test]
+fn network_settings_support_partial_persisted_configuration() {
+    let settings: wisp_dto::NetworkSettings = serde_json::from_value(json!({
+        "model_proxy_url": "none",
+        "pip_index_url": "https://mirror.test/simple"
+    }))
+    .unwrap();
+    assert!(settings.mcp_proxy_url.is_empty());
+    assert!(settings.subscription_proxy_url.is_empty());
+    assert!(settings.command_proxy_url.is_empty());
+    let ui: wisp_dto::NetworkSettings = roundtrip(&settings);
+    assert_eq!(ui, settings);
+}
+
+#[test]
+fn restored_acp_session_state_contract() {
+    let backend = wisp_dto::AcpSessionState {
+        frame_id: "frame-a".into(),
+        modes: Some(json!({"availableModes": [{"id":"plan","name":"Plan"}]})),
+        config_options: Some(vec![json!({"id":"model","currentValue":"smart"})]),
+    };
+    let ui: wisp_dto::AcpSessionState = roundtrip(&backend);
+    assert_eq!(ui.frame_id, "frame-a");
+    assert_eq!(ui.config_options.unwrap()[0]["currentValue"], "smart");
+    assert_eq!(ui.modes.unwrap()["availableModes"][0]["id"], "plan");
+}
+
+#[test]
+fn session_excerpt_keeps_turn_range_and_defaults_truncated() {
+    let excerpt = wisp_dto::SessionExcerpt {
+        session_id: "frame-1".into(),
+        title: "QC notes".into(),
+        start_user_index: 2,
+        end_user_index: 4,
+        text: "User:\nq\n\nAssistant:\na".into(),
+        truncated: true,
+    };
+    let wire = serde_json::to_value(&excerpt).unwrap();
+    assert_eq!(wire["session_id"], "frame-1");
+    assert_eq!(wire["start_user_index"], 2);
+    assert_eq!(wire["end_user_index"], 4);
+    assert_eq!(wire["truncated"], true);
+    let decoded: wisp_dto::SessionExcerpt = roundtrip(&excerpt);
+    assert_eq!(decoded, excerpt);
+    assert_eq!(decoded.turn_count(), 3);
+    let legacy: wisp_dto::SessionExcerpt = serde_json::from_value(json!({
+        "session_id": "frame-1", "title": "", "start_user_index": 0,
+        "end_user_index": 0, "text": "User:\nq"
+    }))
+    .unwrap();
+    assert!(!legacy.truncated);
+}
+
+#[test]
+fn session_experience_keeps_editable_content_and_evidence_omissions() {
+    let draft = wisp_dto::SessionExperience {
+        content: "## Steps\nValidate counts before normalization.".into(),
+        truncated: true,
+    };
+    let decoded: wisp_dto::SessionExperience = roundtrip(&draft);
+    assert_eq!(decoded, draft);
+}
+
+fn roundtrip<T: serde::Serialize, D: serde::de::DeserializeOwned>(value: &T) -> D {
+    let json = serde_json::to_value(value).expect("backend value must serialize");
+    serde_json::from_value(json).expect("UI DTO must accept the backend payload")
+}
+
+#[test]
+fn remote_connector_tool_keeps_server_description_and_schemas() {
+    let backend = wisp_mcp::RemoteTool {
+        name: "example_query".into(),
+        title: None,
+        description: "Search records.\nReturns a bounded page.".into(),
+        input_schema: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
+        output_schema: Some(json!({"type":"object","properties":{"total":{"type":"integer"}}})),
+        meta: None,
+        annotations: None,
+    };
+    let ui: wisp_dto::ConnectorTool = roundtrip(&backend);
+    assert_eq!(ui.description, backend.description);
+    assert_eq!(ui.input_schema, Some(backend.input_schema));
+    assert_eq!(ui.output_schema, backend.output_schema);
+    assert_eq!(ui.mode, "allow");
+    let legacy: wisp_dto::ConnectorTool =
+        serde_json::from_value(json!({"name":"old","mode":"ask"})).unwrap();
+    assert!(legacy.description.is_empty());
+    assert!(legacy.input_schema.is_none());
+}
+
+#[test]
+fn ssh_host_contract() {
+    let backend = crate::ssh_hosts::SshHost {
+        alias: "gpu".into(),
+        host_name: Some("10.0.0.5".into()),
+        user: Some("alice".into()),
+        port: Some(2222),
+        identity_file: None,
+        notes: Some("lab box".into()),
+        auth_method: Some("password".into()),
+        has_password: true,
+        password: Some("secret".into()),
+    };
+    let json = serde_json::to_value(&backend).unwrap();
+    // Write-only secret must never cross the boundary.
+    assert!(json.get("password").is_none());
+    // The UI's password placeholder depends on this flag being serialized.
+    assert_eq!(json.get("has_password"), Some(&json!(true)));
+
+    let dto: wisp_dto::SshHost = serde_json::from_value(json).unwrap();
+    assert_eq!(dto.alias, "gpu");
+    assert_eq!(dto.host_name.as_deref(), Some("10.0.0.5"));
+    assert_eq!(dto.user.as_deref(), Some("alice"));
+    assert_eq!(dto.port, Some(2222));
+    assert_eq!(dto.notes.as_deref(), Some("lab box"));
+    assert_eq!(dto.auth_method.as_deref(), Some("password"));
+    assert!(dto.has_password);
+    assert_eq!(dto.password, None);
+}
+
+#[test]
+fn model_profile_contract() {
+    let backend = crate::models::ModelProfile {
+        id: "p1".into(),
+        label: "Fast".into(),
+        provider: "openai".into(),
+        api_url: "https://api.example.com".into(),
+        endpoint_suffix: "/gateway".into(),
+        model: "gpt-test".into(),
+        has_api_key: true,
+        active: true,
+        max_tokens: 4096,
+        context_window: 200_000,
+        reasoning_effort: "high".into(),
+        service_tier: "priority".into(),
+        user_agent: "research-client/1.0".into(),
+        send_user_agent: false,
+        send_session_id: Some(true),
+        session_header_name: "x-custom-session".into(),
+        supports_vision: true,
+        use_for_vision: true,
+        use_for_expert: true,
+        use_for_image_generation: false,
+        image_generation_capable: false,
+        image_size: String::new(),
+        image_quality: String::new(),
+        image_aspect_ratio: String::new(),
+        image_resolution: String::new(),
+        use_for_video_generation: true,
+        video_duration_secs: Some(8),
+        video_aspect_ratio: Some("9:16".into()),
+        video_resolution: Some("720p".into()),
+        proxy_url: Some("none".into()),
+    };
+    let dto: wisp_dto::ModelProfile = roundtrip(&backend);
+    assert_eq!(dto.id, "p1");
+    assert_eq!(dto.proxy_url, "none");
+    assert_eq!(dto.label, "Fast");
+    assert_eq!(dto.provider, "openai");
+    assert_eq!(dto.api_url, "https://api.example.com");
+    assert_eq!(dto.endpoint_suffix, "/gateway");
+    assert_eq!(dto.model, "gpt-test");
+    assert!(dto.has_api_key);
+    assert!(dto.active);
+    assert_eq!(dto.max_tokens, 4096);
+    assert_eq!(dto.context_window, 200_000);
+    assert_eq!(dto.reasoning_effort, "high");
+    assert_eq!(dto.service_tier, "priority");
+    assert_eq!(dto.user_agent, "research-client/1.0");
+    assert!(!dto.send_user_agent);
+    assert_eq!(dto.send_session_id, Some(true));
+    assert_eq!(dto.session_header_name, "x-custom-session");
+    assert!(dto.supports_vision);
+    assert!(dto.use_for_vision);
+    assert!(dto.use_for_expert);
+    assert!(!dto.use_for_image_generation);
+    assert!(!dto.image_generation_capable);
+    assert!(dto.use_for_video_generation);
+    assert_eq!(dto.video_duration_secs, Some(8));
+    assert_eq!(dto.video_aspect_ratio.as_deref(), Some("9:16"));
+    assert_eq!(dto.video_resolution.as_deref(), Some("720p"));
+    assert!(wisp_dto::is_video_generation_model(
+        "xai/grok-imagine-video-1.5-preview"
+    ));
+    assert!(!wisp_dto::is_video_generation_model(
+        "grok-imagine-video-2.0"
+    ));
+    assert_eq!(wisp_dto::VIDEO_ASPECT_RATIOS.len(), 5);
+    assert_eq!(wisp_dto::VIDEO_RESOLUTIONS.len(), 3);
+    assert_eq!(wisp_dto::VIDEO_DURATION_MIN_SECS, 1);
+    assert_eq!(wisp_dto::VIDEO_DURATION_MAX_SECS, 15);
+}
+
+#[test]
+fn custom_image_capability_survives_backend_to_ui_contract() {
+    let dto: wisp_dto::ModelProfile = serde_json::from_value(serde_json::json!({
+        "id":"image", "provider":"openai", "model":"vendor/custom-image",
+        "use_for_image_generation":false, "image_generation_capable":true
+    }))
+    .unwrap();
+    assert!(!dto.is_chat_model());
+}
+
+#[test]
+fn runtime_execution_summary_contract() {
+    let backend = crate::runtime_commands::RuntimeExecutionSummary {
+        text: "[error] object 'x' not found".into(),
+        plots: vec!["aGVsbG8=".into(), "d29ybGQ=".into()],
+    };
+    let dto: wisp_dto::RuntimeExecutionSummary = roundtrip(&backend);
+    assert_eq!(dto.text, "[error] object 'x' not found");
+    assert_eq!(
+        dto.plots,
+        vec!["aGVsbG8=".to_string(), "d29ybGQ=".to_string()]
+    );
+}
+
+#[test]
+fn share_social_copy_contract() {
+    let backend = crate::share_social::ShareSocialCopy {
+        platform: crate::share_social::ShareSocialPlatform::Xiaohongshu,
+        highlights: vec![crate::share_social::ShareSocialHighlight {
+            title: "Clean peak".into(),
+            why: "The 530 nm assignment is unambiguous.".into(),
+            message_indexes: vec![1, 3],
+        }],
+        variants: vec![crate::share_social::ShareSocialVariant {
+            title: "Spectrum note".into(),
+            body: "主峰在 530 nm。".into(),
+            hashtags: vec!["#RNA".into()],
+        }],
+    };
+    let json = serde_json::to_value(&backend).unwrap();
+    assert_eq!(json.get("platform"), Some(&json!("xiaohongshu")));
+    assert!(json.get("highlights").is_some());
+    assert!(json.get("variants").is_some());
+    let dto: wisp_dto::ShareSocialCopy = serde_json::from_value(json).unwrap();
+    assert_eq!(dto.platform, wisp_dto::ShareSocialPlatform::Xiaohongshu);
+    assert_eq!(dto.highlights[0].title, "Clean peak");
+    assert_eq!(dto.highlights[0].message_indexes, vec![1, 3]);
+    assert_eq!(dto.variants[0].body, "主峰在 530 nm。");
+    assert_eq!(dto.variants[0].hashtags, vec!["#RNA".to_string()]);
+}
+
+#[test]
+fn execution_context_contract() {
+    let backend = wisp_store::ExecutionContext {
+        id: "ssh:gpu".into(),
+        kind: wisp_store::ExecutionContextKind::Ssh,
+        label: "GPU box".into(),
+        config_json: "{\"alias\":\"gpu\"}".into(),
+        capabilities_json: "{}".into(),
+        last_probe_at: Some(1_700_000_000),
+        last_probe_status: Some("ok".into()),
+        last_probe_error: None,
+        created_at: 1_700_000_000,
+        updated_at: 1_700_000_001,
+    };
+    let dto: wisp_dto::ExecutionContext = roundtrip(&backend);
+    assert_eq!(dto.id, "ssh:gpu");
+    // Backend enum serializes lowercase; the UI matches on these strings.
+    assert_eq!(dto.kind, "ssh");
+    assert_eq!(dto.label, "GPU box");
+    assert_eq!(dto.config_json, "{\"alias\":\"gpu\"}");
+    assert_eq!(dto.capabilities_json, "{}");
+    assert_eq!(dto.last_probe_status.as_deref(), Some("ok"));
+    assert_eq!(dto.last_probe_error, None);
+}
+
+#[test]
+fn run_summary_contract() {
+    let backend = wisp_store::RunSummary {
+        id: "run-1".into(),
+        frame_id: Some("frame-1".into()),
+        context_id: "ssh:gpu".into(),
+        title: "align reads".into(),
+        kind: "shell".into(),
+        status: wisp_store::RunStatus::TimedOut,
+        created_at: 1,
+        started_at: Some(2),
+        ended_at: Some(3),
+        exit_code: Some(124),
+        remote_workdir: Some("/scratch/run-1".into()),
+        timeout_secs: Some(60),
+        last_polled_at: Some(4),
+        last_poll_error: Some("ssh dropped".into()),
+        progress_json: "{}".into(),
+        harvested_at: None,
+        cleaned_at: None,
+        cleanup_error: None,
+        background_requested_at: Some(5),
+        output_fingerprint: "abc".into(),
+    };
+    let dto: wisp_dto::RunSummary = roundtrip(&backend);
+    assert_eq!(dto.id, "run-1");
+    assert_eq!(dto.frame_id.as_deref(), Some("frame-1"));
+    assert_eq!(dto.context_id, "ssh:gpu");
+    assert_eq!(dto.title, "align reads");
+    assert_eq!(dto.kind, "shell");
+    // Backend enum serializes snake_case; the UI matches on these strings.
+    assert_eq!(dto.status, "timed_out");
+    assert_eq!(dto.exit_code, Some(124));
+    assert_eq!(dto.remote_workdir.as_deref(), Some("/scratch/run-1"));
+    assert_eq!(dto.last_poll_error.as_deref(), Some("ssh dropped"));
+    assert_eq!(dto.background_requested_at, Some(5));
+    assert_eq!(dto.output_fingerprint, "abc");
+}
+
+#[test]
+fn project_transfer_progress_contract() {
+    let backend = crate::project_transfer::ProjectTransferProgress {
+        direction: "export",
+        stage: "copying",
+        project_id: Some("proj-1".into()),
+        completed_files: 3,
+        total_files: Some(10),
+        completed_bytes: 1024,
+        total_bytes: Some(4096),
+        current_path: Some("data/reads.fq".into()),
+    };
+    let json = serde_json::to_value(&backend).unwrap();
+    // Event payload is camelCase on the wire.
+    assert!(json.get("projectId").is_some());
+    assert!(json.get("completedFiles").is_some());
+
+    let dto: wisp_dto::ProjectTransferProgress = serde_json::from_value(json).unwrap();
+    assert_eq!(dto.direction, "export");
+    assert_eq!(dto.stage, "copying");
+    assert_eq!(dto.project_id.as_deref(), Some("proj-1"));
+    assert_eq!(dto.completed_files, 3);
+    assert_eq!(dto.total_files, Some(10));
+    assert_eq!(dto.completed_bytes, 1024);
+    assert_eq!(dto.total_bytes, Some(4096));
+    assert_eq!(dto.current_path.as_deref(), Some("data/reads.fq"));
+    assert!(!dto.is_complete());
+    assert!(!dto.is_failed());
+}
+
+#[test]
+fn workspace_session_recovery_contract() {
+    let preview = wisp_dto::WorkspaceSessionRecoveryPreview {
+        workspace_dir: "/study".into(),
+        suggested_name: "Study".into(),
+        archive_count: 4,
+        valid_archive_count: 3,
+        recoverable_session_count: 2,
+        message_count: 648,
+        invalid_archive_count: 1,
+        duplicate_archive_count: 1,
+        earliest_message_at: Some(10),
+        latest_message_at: Some(20),
+    };
+    let decoded: wisp_dto::WorkspaceSessionRecoveryPreview = roundtrip(&preview);
+    assert_eq!(decoded, preview);
+
+    let result = wisp_dto::WorkspaceSessionRecoveryResult {
+        project_id: "project".into(),
+        project_name: "Study".into(),
+        recovered_session_count: 2,
+        message_count: 648,
+        invalid_archive_count: 1,
+        duplicate_archive_count: 1,
+    };
+    let decoded: wisp_dto::WorkspaceSessionRecoveryResult = roundtrip(&result);
+    assert_eq!(decoded, result);
+}
+
+#[test]
+fn trajectory_snapshot_contract() {
+    let backend = crate::trajectory::TrajectorySnapshot {
+        frame_id: "frame-1".into(),
+        model: Some("gpt-x".into()),
+        turns: vec![crate::trajectory::TrajectoryTurn {
+            index: 1,
+            started_at: Some(1_000_000),
+            cells: vec![
+                crate::trajectory::TrajectoryCell {
+                    kind: "user".into(),
+                    summary: "question".into(),
+                    detail_input: None,
+                    detail_output: Some("full question".into()),
+                    ok: None,
+                    is_error: false,
+                    ts: Some(1_000_000),
+                    duration_ms: None,
+                    usage: None,
+                },
+                crate::trajectory::TrajectoryCell {
+                    kind: "tool".into(),
+                    summary: "read_file {\"path\":\"a.rs\"} → contents".into(),
+                    detail_input: Some("{\"path\":\"a.rs\"}".into()),
+                    detail_output: Some("contents".into()),
+                    ok: Some(true),
+                    is_error: false,
+                    ts: Some(1_001_000),
+                    duration_ms: Some(250),
+                    usage: None,
+                },
+                crate::trajectory::TrajectoryCell {
+                    kind: "usage".into(),
+                    summary: "round 1 · 100 in / 50 out".into(),
+                    detail_input: None,
+                    detail_output: None,
+                    ok: None,
+                    is_error: false,
+                    ts: Some(1_004_000),
+                    duration_ms: None,
+                    usage: Some(crate::trajectory::TrajectoryUsage {
+                        round: 1,
+                        model: Some("gpt-x".into()),
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        reasoning_tokens: 10,
+                        cached_input_tokens: 300,
+                    }),
+                },
+            ],
+        }],
+        stats: crate::trajectory::TrajectoryStats {
+            turns: 1,
+            steps: 1,
+            llm_ms: 4000,
+            tool_ms: 250,
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_input_tokens: 300,
+            cache_hit_pct: Some(75.0),
+            tokens_per_sec: Some(12.5),
+        },
+    };
+    let json = serde_json::to_value(&backend).unwrap();
+    // Command payloads are snake_case on the wire; the UI consumes these keys.
+    assert_eq!(json.get("frame_id"), Some(&json!("frame-1")));
+    assert!(json["turns"][0].get("started_at").is_some());
+    assert!(json["turns"][0]["cells"][1].get("detail_input").is_some());
+    assert!(json["turns"][0]["cells"][1].get("duration_ms").is_some());
+    assert!(json["turns"][0]["cells"][2]["usage"]
+        .get("cached_input_tokens")
+        .is_some());
+    assert!(json["stats"].get("cache_hit_pct").is_some());
+    assert!(json["stats"].get("tokens_per_sec").is_some());
+
+    let dto: wisp_dto::TrajectorySnapshotDto = serde_json::from_value(json).unwrap();
+    assert_eq!(dto.frame_id, "frame-1");
+    assert_eq!(dto.model.as_deref(), Some("gpt-x"));
+    assert_eq!(dto.turns.len(), 1);
+    assert_eq!(dto.turns[0].index, 1);
+    assert_eq!(dto.turns[0].started_at, Some(1_000_000));
+    let cells = &dto.turns[0].cells;
+    assert_eq!(cells[0].kind, "user");
+    assert_eq!(cells[0].detail_output.as_deref(), Some("full question"));
+    assert_eq!(cells[1].kind, "tool");
+    assert_eq!(
+        cells[1].detail_input.as_deref(),
+        Some("{\"path\":\"a.rs\"}")
+    );
+    assert_eq!(cells[1].ok, Some(true));
+    assert!(!cells[1].is_error);
+    assert_eq!(cells[1].duration_ms, Some(250));
+    let usage = cells[2].usage.as_ref().expect("usage cell carries usage");
+    assert_eq!(usage.round, 1);
+    assert_eq!(usage.model.as_deref(), Some("gpt-x"));
+    assert_eq!(usage.input_tokens, 100);
+    assert_eq!(usage.output_tokens, 50);
+    assert_eq!(usage.reasoning_tokens, 10);
+    assert_eq!(usage.cached_input_tokens, 300);
+    assert_eq!(dto.stats.turns, 1);
+    assert_eq!(dto.stats.steps, 1);
+    assert_eq!(dto.stats.llm_ms, 4000);
+    assert_eq!(dto.stats.tool_ms, 250);
+    assert_eq!(dto.stats.cache_hit_pct, Some(75.0));
+    assert_eq!(dto.stats.tokens_per_sec, Some(12.5));
+}
+
+#[test]
+fn session_notice_contract() {
+    let notice = wisp_dto::SessionNotice {
+        project_id: "proj-b".into(),
+        project_name: "Project B".into(),
+        session_id: "s-b".into(),
+        session_title: "Long fit".into(),
+        kind: "done".into(),
+    };
+    let dto: wisp_dto::SessionNotice = roundtrip(&notice);
+    assert_eq!(dto, notice);
+    let sparse: wisp_dto::SessionNotice = serde_json::from_value(serde_json::json!({
+        "project_id": "proj-b",
+        "session_id": "s-b",
+        "kind": "error",
+    }))
+    .unwrap();
+    assert_eq!(sparse.project_name, "");
+    assert_eq!(sparse.session_title, "");
+}
+
+#[test]
+fn browser_tab_cleanup_prompt_contract() {
+    let prompt = wisp_dto::BrowserTabCleanupPrompt {
+        turn_id: "turn-1".into(),
+        frame_id: "frame-1".into(),
+        tabs: vec![wisp_dto::BrowserTabCleanupItem {
+            session: "shared".into(),
+            tab_id: 42,
+            url: "https://example.com/paper".into(),
+            title: "Paper".into(),
+            initial_url: "https://example.com".into(),
+        }],
+    };
+    let dto: wisp_dto::BrowserTabCleanupPrompt = roundtrip(&prompt);
+    assert_eq!(dto.turn_id, "turn-1");
+    assert_eq!(dto.frame_id, "frame-1");
+    assert_eq!(dto.tabs[0].session, "shared");
+    assert_eq!(dto.tabs[0].tab_id, 42);
+    assert_eq!(dto.tabs[0].url, "https://example.com/paper");
+    assert_eq!(dto.tabs[0].title, "Paper");
+    assert_eq!(dto.tabs[0].initial_url, "https://example.com");
+}
+
+#[test]
+fn browser_needs_human_prompt_contract() {
+    let prompt = wisp_dto::BrowserNeedsHumanPrompt {
+        tabs: vec![wisp_dto::BrowserNeedsHumanTab {
+            session: "shared".into(),
+            tab_id: 12,
+            url: "https://www.sciencedirect.com/science".into(),
+            title: "Just a moment...".into(),
+            reason: "captcha_challenge".into(),
+            frame_id: "frame-1".into(),
+            turn_id: "turn-1".into(),
+        }],
+    };
+    let dto: wisp_dto::BrowserNeedsHumanPrompt = roundtrip(&prompt);
+    assert_eq!(dto.tabs.len(), 1);
+    assert_eq!(dto.tabs[0].session, "shared");
+    assert_eq!(dto.tabs[0].tab_id, 12);
+    assert_eq!(dto.tabs[0].reason, "captcha_challenge");
+    assert_eq!(dto.tabs[0].frame_id, "frame-1");
+    let result = wisp_dto::BrowserNeedsHumanConfirmResult {
+        still_required: dto.tabs.clone(),
+        cleared: Vec::new(),
+    };
+    let dto: wisp_dto::BrowserNeedsHumanConfirmResult = roundtrip(&result);
+    assert_eq!(dto.still_required[0].tab_id, 12);
+    assert!(dto.cleared.is_empty());
+}
+
+#[test]
+fn mcp_connection_list_contract_redacts_secrets() {
+    let backend = crate::McpConnection {
+        id: "conn-1".into(),
+        name: "remote".into(),
+        enabled: true,
+        transport: crate::McpTransport::Http {
+            url: "https://example.test/mcp".into(),
+            headers: vec![wisp_dto::McpSecretEntry::plaintext(
+                "Authorization",
+                "secret-value",
+            )],
+            auth: crate::McpHttpAuth::None,
+        },
+        proxy_url: "socks5://localhost:1080".into(),
+    };
+    let json = serde_json::to_value(&backend).expect("backend value must serialize");
+    assert!(json["transport"]["headers"][0].get("value").is_none());
+    assert!(!json.to_string().contains("secret-value"));
+    assert_eq!(json["transport"]["headers"][0]["name"], "Authorization");
+    assert_eq!(json["transport"]["headers"][0]["has_value"], true);
+
+    let dto: wisp_dto::ConnRow = serde_json::from_value(json).unwrap();
+    assert_eq!(dto.proxy_url, "socks5://localhost:1080");
+    match dto.transport {
+        wisp_dto::ConnTransport::Http { headers, .. } => {
+            assert_eq!(headers[0].name, "Authorization");
+            assert!(headers[0].has_value);
+            assert_eq!(headers[0].value, None);
+        }
+        _ => panic!("expected http"),
+    }
+}
+
+#[test]
+fn channels_status_contract_includes_feishu_owner() {
+    let backend = crate::channels::ChannelsStatus {
+        feishu_enabled: true,
+        feishu_bound: true,
+        feishu_international: false,
+        feishu_app_id: "cli_1".into(),
+        feishu_has_secret: true,
+        feishu_state: "running".into(),
+        feishu_detail: String::new(),
+        feishu_owner_open_id: "ou_owner".into(),
+        feishu_pending_owner_open_id: "ou_pending".into(),
+        weixin_enabled: false,
+        weixin_bound: false,
+        weixin_state: "stopped".into(),
+        weixin_detail: String::new(),
+        device: crate::device_bridge::DeviceBridgeSettingsStatus {
+            enabled: false,
+            mode: crate::device_bridge::DeviceBridgeMode::Lan,
+            has_token: false,
+            runtime: crate::device_bridge::DeviceBridgeRuntimeStatus::default(),
+        },
+        remote: wisp_dto::RemoteAccessStatus {
+            enabled: true,
+            state: "running".into(),
+            link: Some("https://relay.example.test/remote#0000".into()),
+            qr: Some("data:image/svg+xml;base64,PHN2Zy8+".into()),
+            clients: 2,
+            ..Default::default()
+        },
+    };
+    let dto: wisp_dto::ChannelsStatus = roundtrip(&backend);
+    assert_eq!(dto.remote, backend.remote);
+    assert_eq!(dto.feishu_owner_open_id, "ou_owner");
+    assert_eq!(dto.feishu_pending_owner_open_id, "ou_pending");
+    assert_eq!(dto.feishu_app_id, "cli_1");
+}
+
+#[test]
+fn lab_status_contract_keeps_members_and_the_knowledge_base() {
+    let backend = wisp_dto::LabStatus {
+        state: "active".into(),
+        relay_url: "https://relay.example.test".into(),
+        has_token: true,
+        member_name: "Ada".into(),
+        member_id: "m1".into(),
+        lab_name: "Genomics".into(),
+        leader: true,
+        members: vec![wisp_dto::LabMemberInfo {
+            id: "m2".into(),
+            name: "Lin".into(),
+            leader: false,
+            pending: true,
+        }],
+        knowledge_base: Some(wisp_dto::LabKnowledgeBaseInfo {
+            project_id: "kb".into(),
+            local: true,
+            project_name: "Lab handbook".into(),
+        }),
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&backend).unwrap();
+    // The settings pane reads these exact snake_case fields.
+    assert_eq!(json["members"][0]["pending"], true);
+    assert_eq!(json["knowledge_base"]["project_name"], "Lab handbook");
+    let dto: wisp_dto::LabStatus = roundtrip(&backend);
+    assert_eq!(dto, backend);
+    // A computer that never joined sends almost nothing; defaults fill in.
+    let empty: wisp_dto::LabStatus =
+        serde_json::from_value(serde_json::json!({ "state": "none" })).unwrap();
+    assert!(empty.members.is_empty() && empty.knowledge_base.is_none());
+}
+
+#[test]
+fn project_memo_contract_keeps_private_fields_and_partial_patches() {
+    let backend = wisp_dto::ProjectMemo {
+        id: "memo".into(),
+        project_id: "p".into(),
+        title: String::new(),
+        body: "ssh gpu02 first".into(),
+        pinned: true,
+        created_at: 10,
+        updated_at: 20,
+    };
+    let ui: wisp_dto::ProjectMemo = roundtrip(&backend);
+    assert_eq!(ui, backend);
+    // The UI may omit the title on create and send only the changed fields
+    // on update; absent fields stay untouched instead of clearing.
+    let input: wisp_dto::ProjectMemoInput =
+        serde_json::from_value(json!({ "body": "Opening prompt" })).unwrap();
+    assert_eq!(input.title, "");
+    let patch: wisp_dto::ProjectMemoPatch =
+        serde_json::from_value(json!({ "id": "memo", "pinned": false })).unwrap();
+    assert_eq!(
+        patch,
+        wisp_dto::ProjectMemoPatch {
+            id: "memo".into(),
+            title: None,
+            body: None,
+            pinned: Some(false),
+        }
+    );
+}
+
+#[test]
+fn research_journey_contract_preserves_version_and_occurrence_time() {
+    let backend = wisp_dto::ResearchJourney {
+        entries: vec![wisp_dto::ResearchJourneyEntry {
+            id: "version:v1".into(),
+            kind: "artifact".into(),
+            title: "figure.png".into(),
+            occurred_at: 100,
+            recorded_at: 200,
+            source_id: "v1".into(),
+            version_number: Some(1),
+            source_discarded: true,
+            run_id: Some("run".into()),
+            ..Default::default()
+        }],
+        truncated: true,
+        recaps: vec![wisp_dto::ResearchRecap {
+            id: "recap".into(),
+            day_start: 0,
+            status: "draft".into(),
+            headline: "Compared methods".into(),
+            done: vec![wisp_dto::ResearchRecapItem {
+                text: "Ran comparison".into(),
+                refs: vec![0],
+            }],
+            sources: vec![wisp_dto::ResearchRecapSource {
+                kind: "run".into(),
+                id: "run".into(),
+                title: "Compare".into(),
+            }],
+            ..Default::default()
+        }],
+    };
+    let ui: wisp_dto::ResearchJourney = roundtrip(&backend);
+    assert_eq!(ui, backend);
+    let source = wisp_dto::ResearchJourneySource {
+        run_id: Some("run".into()),
+        generated_at: Some(90),
+        inputs: vec![wisp_dto::ResearchJourneyInput {
+            title: "counts.csv".into(),
+            role: "counts".into(),
+            version_id: Some("input-v2".into()),
+            confidence: "exact".into(),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        roundtrip::<_, wisp_dto::ResearchJourneySource>(&source),
+        source
+    );
+}
+
+#[test]
+fn research_calendar_contract_preserves_project_errors_and_truncation() {
+    let backend = vec![
+        wisp_dto::ResearchCalendarProject {
+            project_id: "p".into(),
+            history: wisp_dto::ResearchJourney {
+                truncated: true,
+                ..Default::default()
+            },
+            error: None,
+        },
+        wisp_dto::ResearchCalendarProject {
+            project_id: "missing".into(),
+            error: Some("Project no longer exists".into()),
+            ..Default::default()
+        },
+    ];
+    assert_eq!(
+        roundtrip::<_, Vec<wisp_dto::ResearchCalendarProject>>(&backend),
+        backend
+    );
+}
+#[test]
+fn renderer_health_accepts_partial_numeric_snapshots() {
+    let snapshot: wisp_dto::UiHealthSnapshot = serde_json::from_value(serde_json::json!({
+        "timerLagMs": 850, "activeApps": 1, "parkedApps": 2, "scriptErrors": 3,
+        "recentLongestTaskMs": 75, "transcriptSwitchMs": 120, "transcriptRebuilds": 2,
+        "transcriptRetries": 1, "transcriptItems": 3700, "transcriptRows": 50,
+        "mediaBlobUrls": 42, "mediaBlobBytes": 5_000_000_000_u64, "mediaOwners": 12
+    }))
+    .unwrap();
+    assert_eq!(snapshot.timer_lag_ms, 850);
+    assert_eq!(snapshot.recent_longest_task_ms, 75);
+    assert_eq!(snapshot.transcript_switch_ms, 120);
+    assert_eq!(snapshot.transcript_rebuilds, 2);
+    assert_eq!(snapshot.transcript_retries, 1);
+    assert_eq!(snapshot.transcript_items, 3700);
+    assert_eq!(snapshot.transcript_rows, 50);
+    assert_eq!(snapshot.active_apps, 1);
+    assert_eq!(snapshot.parked_apps, 2);
+    assert_eq!(snapshot.script_errors, 3);
+    assert_eq!(snapshot.app_messages, 0);
+    assert_eq!(snapshot.media_blob_urls, 42);
+    assert_eq!(snapshot.media_blob_bytes, 5_000_000_000);
+    assert_eq!(snapshot.media_owners, 12);
+    assert_eq!(snapshot.first_fault, "");
+    assert_eq!(snapshot.first_invalid_args, "");
+    assert_eq!(
+        serde_json::from_value::<wisp_dto::UiHealthSnapshot>(serde_json::json!({}))
+            .unwrap()
+            .media_blob_urls,
+        0
+    );
+    let encoded = serde_json::to_value(snapshot).unwrap();
+    assert_eq!(encoded["timerLagMs"], 850);
+    assert_eq!(encoded["firstFault"], "");
+    assert_eq!(encoded["firstInvalidArgs"], "");
+    let faulted = serde_json::from_value::<wisp_dto::UiHealthSnapshot>(serde_json::json!({
+        "firstFault": "panicked at ui/src/app_support/model_settings.rs:1:2: boom",
+        "firstInvalidArgs": "invalid args `spec` for command `save_reviewer`"
+    }))
+    .unwrap();
+    assert_eq!(
+        faulted.first_fault,
+        "panicked at ui/src/app_support/model_settings.rs:1:2: boom"
+    );
+    assert_eq!(
+        faulted.first_invalid_args,
+        "invalid args `spec` for command `save_reviewer`"
+    );
+    assert!(
+        serde_json::from_value::<wisp_dto::UiHealthSnapshot>(serde_json::json!({
+            "scriptErrors": "arbitrary content"
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn transfer_progress_preserves_indeterminate_and_accepts_legacy_records() {
+    let legacy = json!({
+        "phase": "uploading", "direction": "relay", "completed_bytes": 0,
+        "total_bytes": 1024, "files_completed": 0, "files_total": 1,
+        "current_file": null, "bytes_per_second": null, "eta_seconds": null,
+        "updated_at": 100,
+    });
+    let mut backend: wisp_store::RunProgress = serde_json::from_value(legacy.clone()).unwrap();
+    let old_ui: wisp_dto::RunProgress = serde_json::from_value(legacy).unwrap();
+    assert!(!backend.indeterminate);
+    assert!(!old_ui.indeterminate);
+    backend.indeterminate = true;
+    let ui: wisp_dto::RunProgress = roundtrip(&backend);
+    assert!(ui.indeterminate);
+    assert_eq!(ui.total_bytes, 1024);
+    assert_eq!(ui.completed_bytes, 0);
+}
+
+#[test]
+fn native_approval_snapshot_and_resolution_share_the_request_contract() {
+    let request = super::ConfirmRequest::new(
+        "frame",
+        "Approve transfer?".into(),
+        "transfer_between_contexts",
+        "CPU3 to local".into(),
+    );
+    let loaded: wisp_dto::PendingToolApproval = roundtrip(&request);
+    assert_eq!(loaded.approval_id, request.approval_id);
+    assert_eq!(loaded.frame_id, "frame");
+    assert_eq!(loaded.tool, "transfer_between_contexts");
+    let page: wisp_dto::LoadedSessionPage = serde_json::from_value(json!({
+        "items": [], "next_before_seq": null, "user_offset": 0, "pending_approvals": [loaded]
+    }))
+    .unwrap();
+    assert_eq!(page.pending_approvals[0].preview, "CPU3 to local");
+    let legacy: wisp_dto::LoadedSessionPage = serde_json::from_value(json!({
+        "items": [], "next_before_seq": null, "user_offset": 0
+    }))
+    .unwrap();
+    assert!(legacy.pending_approvals.is_empty());
+}
+
+#[test]
+fn stream_recovery_event_roundtrips_and_tolerates_a_minimal_payload() {
+    let backend = super::AgentEvent::StreamRecovery {
+        frame_id: "f".into(),
+        phase: "waiting".into(),
+        cause: "stream".into(),
+        attempt: 1,
+        max_attempts: 5,
+        retry_in_ms: 1_000,
+        error: "stream ended without completion".into(),
+        discarded_text_bytes: 17,
+        discarded_reasoning_bytes: 4,
+    };
+    let wire = serde_json::to_value(&backend).unwrap();
+    assert_eq!(wire["kind"], "StreamRecovery");
+    assert_eq!(wire["cause"], "stream");
+    match roundtrip::<_, wisp_dto::AgentEvent>(&backend) {
+        wisp_dto::AgentEvent::StreamRecovery {
+            phase,
+            cause,
+            attempt,
+            max_attempts,
+            retry_in_ms,
+            discarded_text_bytes,
+            discarded_reasoning_bytes,
+            ..
+        } => {
+            assert_eq!((phase.as_str(), cause.as_str()), ("waiting", "stream"));
+            assert_eq!((attempt, max_attempts, retry_in_ms), (1, 5, 1_000));
+            assert_eq!((discarded_text_bytes, discarded_reasoning_bytes), (17, 4));
+        }
+        _ => panic!("expected StreamRecovery"),
+    }
+
+    let minimal: wisp_dto::AgentEvent = serde_json::from_value(json!({
+        "kind": "StreamRecovery",
+        "frame_id": "f",
+        "phase": "recovered"
+    }))
+    .unwrap();
+    match minimal {
+        wisp_dto::AgentEvent::StreamRecovery {
+            phase,
+            attempt,
+            discarded_text_bytes,
+            ..
+        } => {
+            assert_eq!(phase, "recovered");
+            assert_eq!((attempt, discarded_text_bytes), (0, 0));
+        }
+        _ => panic!("expected StreamRecovery"),
+    }
+}
+
+#[test]
+fn compaction_event_accepts_missing_and_present_epoch() {
+    let legacy: wisp_dto::AgentEvent = serde_json::from_value(json!({
+        "kind": "Compaction",
+        "frame_id": "f",
+        "before": 100,
+        "after": 40,
+        "strategy": "auto"
+    }))
+    .unwrap();
+    match legacy {
+        wisp_dto::AgentEvent::Compaction {
+            epoch, strategy, ..
+        } => {
+            assert_eq!(epoch, None);
+            assert_eq!(strategy, "auto");
+        }
+        _ => panic!("expected Compaction"),
+    }
+
+    let backend = super::AgentEvent::Compaction {
+        frame_id: "f".into(),
+        before: 100,
+        after: 40,
+        strategy: "manual".into(),
+        epoch: Some(2),
+    };
+    let wire = serde_json::to_value(&backend).unwrap();
+    assert_eq!(wire["epoch"], 2);
+    let ui: wisp_dto::AgentEvent = roundtrip(&backend);
+    match ui {
+        wisp_dto::AgentEvent::Compaction {
+            epoch,
+            strategy,
+            before,
+            after,
+            ..
+        } => {
+            assert_eq!(epoch, Some(2));
+            assert_eq!(strategy, "manual");
+            assert_eq!((before, after), (100, 40));
+        }
+        _ => panic!("expected Compaction"),
+    }
+
+    let item = wisp_dto::LoadedItem {
+        role: "compaction".into(),
+        text: r#"{"before":100,"after":40,"strategy":"auto"}"#.into(),
+        tool_name: None,
+        ok: None,
+        duration_ms: None,
+        input: String::new(),
+        model_name: None,
+        call_id: None,
+        kind: None,
+        status: None,
+        locations: None,
+        resources: Vec::new(),
+    };
+    match item.into_chat() {
+        wisp_dto::ChatItem::Compaction { epoch, .. } => assert_eq!(epoch, None),
+        _ => panic!("expected ChatItem::Compaction"),
+    }
+    let linked = wisp_dto::LoadedItem {
+        role: "compaction".into(),
+        text: r#"{"before":100,"after":40,"strategy":"manual","epoch":2}"#.into(),
+        tool_name: None,
+        ok: None,
+        duration_ms: None,
+        input: String::new(),
+        model_name: None,
+        call_id: None,
+        kind: None,
+        status: None,
+        locations: None,
+        resources: Vec::new(),
+    };
+    match linked.into_chat() {
+        wisp_dto::ChatItem::Compaction {
+            epoch, strategy, ..
+        } => {
+            assert_eq!(epoch, Some(2));
+            assert_eq!(strategy, "manual");
+        }
+        _ => panic!("expected ChatItem::Compaction"),
+    }
+}
+
+#[test]
+fn compaction_undone_event_roundtrips_and_chat_item_defaults() {
+    let backend = super::AgentEvent::CompactionUndone {
+        frame_id: "f".into(),
+        epoch: 2,
+    };
+    let ui: wisp_dto::AgentEvent = roundtrip(&backend);
+    match ui {
+        wisp_dto::AgentEvent::CompactionUndone { frame_id, epoch } => {
+            assert_eq!(frame_id, "f");
+            assert_eq!(epoch, 2);
+        }
+        _ => panic!("expected CompactionUndone"),
+    }
+    let page: wisp_dto::LoadedSessionPage = serde_json::from_value(json!({
+        "items": [], "next_before_seq": null, "user_offset": 0
+    }))
+    .unwrap();
+    assert!(page.context_epochs.is_empty());
+    assert_eq!(page.head_epoch, 0);
+    assert_eq!(page.in_context_from_user_index, None);
+
+    let marked: wisp_dto::LoadedSessionPage = serde_json::from_value(json!({
+        "items": [],
+        "next_before_seq": null,
+        "user_offset": 0,
+        "in_context_from_user_index": 2
+    }))
+    .unwrap();
+    assert_eq!(marked.in_context_from_user_index, Some(2));
+
+    match (wisp_dto::LoadedItem {
+        role: "system".into(),
+        text: "sys".into(),
+        tool_name: None,
+        ok: None,
+        duration_ms: None,
+        input: String::new(),
+        model_name: None,
+        call_id: None,
+        kind: Some("system".into()),
+        status: None,
+        locations: None,
+        resources: Vec::new(),
+    })
+    .into_chat()
+    {
+        wisp_dto::ChatItem::System(text) => assert_eq!(text, "sys"),
+        _ => panic!("expected ChatItem::System"),
+    }
+    match (wisp_dto::LoadedItem {
+        role: "checkpoint".into(),
+        text: "[context summary checkpoint]\n\nfolded".into(),
+        tool_name: None,
+        ok: None,
+        duration_ms: None,
+        input: String::new(),
+        model_name: None,
+        call_id: None,
+        kind: Some("checkpoint".into()),
+        status: None,
+        locations: None,
+        resources: Vec::new(),
+    })
+    .into_chat()
+    {
+        wisp_dto::ChatItem::Checkpoint(text) => {
+            assert!(text.contains("[context summary checkpoint]"));
+        }
+        _ => panic!("expected ChatItem::Checkpoint"),
+    }
+
+    let item = wisp_dto::LoadedItem {
+        role: "compaction".into(),
+        text: r#"{"before":10,"after":4,"strategy":"manual","epoch":1,"checkpoint":"folded","kept_from_user_index":2,"undone":true,"can_undo":false,"undo_reason":"undone"}"#.into(),
+        tool_name: None,
+        ok: None,
+        duration_ms: None,
+        input: String::new(),
+        model_name: None,
+        call_id: None,
+        kind: None,
+        status: None,
+        locations: None,
+        resources: Vec::new(),
+    };
+    match item.into_chat() {
+        wisp_dto::ChatItem::Compaction {
+            checkpoint,
+            kept_from_user_index,
+            undone,
+            can_undo,
+            undo_reason,
+            ..
+        } => {
+            assert_eq!(checkpoint.as_deref(), Some("folded"));
+            assert_eq!(kept_from_user_index, Some(2));
+            assert!(undone);
+            assert!(!can_undo);
+            assert_eq!(undo_reason.as_deref(), Some("undone"));
+        }
+        _ => panic!("expected ChatItem::Compaction"),
+    }
+}
+
+#[test]
+fn context_state_refresh_contract_keeps_parent_and_compaction_details() {
+    let value = serde_json::json!({
+        "head_epoch": 3, "context_epochs": [{"epoch":3,"parent_epoch":1,
+            "strategy":"auto","kind":"semantic","before_tokens":1000,"after_tokens":200,
+            "initial_head_seq":20}],
+        "in_context_from_user_index":2, "undone_epochs":[2],
+        "compactions":[{"epoch":3,"before":1000,"after":200,"strategy":"auto",
+            "checkpoint":"folded", "kept_from_user_index":2,"can_undo":true}]
+    });
+    let state: wisp_dto::SessionContextState = serde_json::from_value(value).unwrap();
+    assert_eq!(state.context_epochs[0].parent_epoch, 1);
+    assert_eq!(state.undone_epochs, [2]);
+    assert!(matches!(state.compactions[0].clone().into_chat(),
+        wisp_dto::ChatItem::Compaction { epoch: Some(3), checkpoint: Some(text), can_undo: true, .. } if text == "folded"));
+}
+
+#[test]
+fn project_summary_star_defaults_for_older_payloads_and_roundtrips() {
+    let legacy = json!({"id": "p", "name": "Project"});
+    let mut summary: wisp_dto::ProjectSummary = serde_json::from_value(legacy).unwrap();
+    assert!(!summary.starred);
+    summary.starred = true;
+    let payload = serde_json::to_value(&summary).unwrap();
+    assert_eq!(payload["starred"], true);
+    let decoded: wisp_dto::ProjectSummary = serde_json::from_value(payload).unwrap();
+    assert!(decoded.starred);
+}
+
+#[test]
+fn project_storage_setting_roundtrips_between_backend_and_ui() {
+    let baseline = serde_json::to_value(wisp_dto::Settings::default()).unwrap();
+    for enabled in [false, true] {
+        let mut payload = baseline.clone();
+        payload["decentralized_project_storage"] = json!(enabled);
+        let backend: crate::Settings = serde_json::from_value(payload).unwrap();
+        let ui: wisp_dto::Settings = roundtrip(&backend);
+        assert_eq!(ui.decentralized_project_storage, enabled);
+    }
+    let mut legacy = baseline;
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("decentralized_project_storage");
+    let ui: wisp_dto::Settings = serde_json::from_value(legacy).unwrap();
+    assert!(!ui.decentralized_project_storage);
+}
+
+#[test]
+fn notification_sound_settings_roundtrip_and_default_off_for_older_payloads() {
+    let mut payload = serde_json::to_value(wisp_dto::Settings::default()).unwrap();
+    payload["notifications_enabled"] = json!(false);
+    payload["notification_sound_enabled"] = json!(true);
+    payload["notification_sound"] = json!("Ping");
+    let backend: crate::Settings = serde_json::from_value(payload.clone()).unwrap();
+    let ui: wisp_dto::Settings = roundtrip(&backend);
+    assert!(!ui.notifications_enabled);
+    assert!(ui.notification_sound_enabled);
+    assert_eq!(ui.notification_sound, "Ping");
+
+    let legacy = payload.as_object_mut().unwrap();
+    legacy.remove("notification_sound_enabled");
+    legacy.remove("notification_sound");
+    let backend: crate::Settings = serde_json::from_value(payload).unwrap();
+    let ui: wisp_dto::Settings = roundtrip(&backend);
+    assert!(!ui.notification_sound_enabled);
+    assert_eq!(ui.notification_sound, "");
+}
+
+#[test]
+fn notification_sound_catalog_reaches_the_ui_shape() {
+    let sounds = crate::notification_sound::list_notification_sounds();
+    let ui: Vec<wisp_dto::NotificationSound> = roundtrip(&sounds);
+    assert_eq!(ui, sounds);
+    assert!(ui
+        .iter()
+        .all(|sound| !sound.id.is_empty() && !sound.label.is_empty()));
+}
+
+#[test]
+fn after_turn_hook_events_roundtrip_to_ui() {
+    let backend: super::AgentEvent = serde_json::from_value(json!({
+        "kind": "MemoryProposal",
+        "frame_id": "f",
+        "proposal": {
+            "session_id": "f", "turn_index": 2, "scope": "project",
+            "content": "Validate paths before retrying.", "trigger": "tool_failures",
+            "tool_calls": 3, "failed_tool_calls": 2, "failure_rate": 66.7,
+            "global_memories": []
+        }
+    }))
+    .expect("backend accepts its own proposal shape");
+    match roundtrip::<_, wisp_dto::AgentEvent>(&backend) {
+        wisp_dto::AgentEvent::MemoryProposal { frame_id, proposal } => {
+            assert_eq!(frame_id, "f");
+            assert_eq!(proposal.turn_index, 2);
+            assert_eq!(proposal.trigger, "tool_failures");
+            assert_eq!(proposal.failed_tool_calls, 2);
+        }
+        _ => panic!("expected MemoryProposal"),
+    }
+
+    let backend = super::AgentEvent::FollowUps {
+        frame_id: "f".into(),
+        questions: vec!["One?".into(), "Two?".into(), "Three?".into()],
+    };
+    match roundtrip::<_, wisp_dto::AgentEvent>(&backend) {
+        wisp_dto::AgentEvent::FollowUps { questions, .. } => assert_eq!(questions.len(), 3),
+        _ => panic!("expected FollowUps"),
+    }
+
+    let backend = super::AgentEvent::HookFailed {
+        frame_id: "f".into(),
+        hook: crate::turn_hooks::HookId::MemoryProposal.as_str().into(),
+        message: "Reviewer ACP Agent is not configured.".into(),
+    };
+    match roundtrip::<_, wisp_dto::AgentEvent>(&backend) {
+        wisp_dto::AgentEvent::HookFailed { hook, message, .. } => {
+            assert_eq!(hook, "memory_proposal");
+            assert!(message.contains("not configured"));
+        }
+        _ => panic!("expected HookFailed"),
+    }
+}
+
+#[test]
+fn branch_opened_event_roundtrips_to_ui() {
+    let backend = super::AgentEvent::BranchOpened {
+        frame_id: "parent".into(),
+        branch_id: "branch".into(),
+        title: "Try method B".into(),
+        brief: "Compare method B against the baseline.".into(),
+    };
+    match roundtrip::<_, wisp_dto::AgentEvent>(&backend) {
+        wisp_dto::AgentEvent::BranchOpened {
+            frame_id,
+            branch_id,
+            title,
+            brief,
+        } => {
+            assert_eq!(frame_id, "parent");
+            assert_eq!(branch_id, "branch");
+            assert_eq!(title, "Try method B");
+            assert_eq!(brief, "Compare method B against the baseline.");
+        }
+        _ => panic!("expected BranchOpened"),
+    }
+}
+
+#[test]
+fn run_background_finished_event_roundtrips_to_ui() {
+    let backend = super::AgentEvent::RunBackgroundFinished {
+        frame_id: "f".into(),
+        run_id: "run-1".into(),
+        title: "Align reads".into(),
+        status: wisp_store::RunStatus::TimedOut.as_str().into(),
+    };
+    match roundtrip::<_, wisp_dto::AgentEvent>(&backend) {
+        wisp_dto::AgentEvent::RunBackgroundFinished {
+            frame_id,
+            run_id,
+            title,
+            status,
+        } => {
+            assert_eq!(frame_id, "f");
+            assert_eq!(run_id, "run-1");
+            assert_eq!(title, "Align reads");
+            assert_eq!(status, "timed_out");
+        }
+        _ => panic!("expected RunBackgroundFinished"),
+    }
+}
+
+#[test]
+fn session_artifact_preview_includes_review_token_and_retention_reasons() {
+    let preview = wisp_dto::SessionArtifactPreview {
+        fingerprint: "content-and-ownership-hash".into(),
+        artifacts: vec!["plot.svg".into()],
+        files: vec!["results/plot.svg".into()],
+        retained: vec![wisp_dto::RetainedSessionArtifact {
+            name: "uploads/input.csv".into(),
+            reason: "upload".into(),
+        }],
+    };
+    let decoded: wisp_dto::SessionArtifactPreview = roundtrip(&preview);
+    assert_eq!(decoded, preview);
+}
+
+#[test]
+fn session_children_preview_counts_each_kind() {
+    let preview = wisp_dto::SessionChildrenPreview {
+        subagents: 2,
+        branches: 1,
+        explorations: 3,
+        nested: vec!["subagent".into()],
+    };
+    let decoded: wisp_dto::SessionChildrenPreview = roundtrip(&preview);
+    assert_eq!(decoded, preview);
+    assert!(!decoded.is_empty());
+    assert!(wisp_dto::SessionChildrenPreview::default().is_empty());
+    // A selection that already holds every child leaves nothing to count.
+    let whole_family: wisp_dto::SessionChildrenPreview = serde_json::from_value(
+        serde_json::json!({"subagents": 0, "branches": 0, "explorations": 0, "nested": ["subagent"]}),
+    )
+    .unwrap();
+    assert!(whole_family.is_empty());
+    assert_eq!(whole_family.nested, ["subagent"]);
+    // Payloads from before `nested` still decode.
+    let older: wisp_dto::SessionChildrenPreview = serde_json::from_value(
+        serde_json::json!({"subagents": 1, "branches": 0, "explorations": 0}),
+    )
+    .unwrap();
+    assert!(older.nested.is_empty());
+}
+
+#[test]
+fn session_family_artifact_preview_keys_each_child_preview_by_id() {
+    let preview = |fingerprint: &str| wisp_dto::SessionArtifactPreview {
+        fingerprint: fingerprint.into(),
+        artifacts: vec!["plot.svg".into()],
+        files: vec!["results/plot.svg".into()],
+        retained: vec![],
+    };
+    let family = wisp_dto::SessionFamilyArtifactPreview {
+        id: "parent".into(),
+        preview: preview("parent-fp"),
+        children: vec![wisp_dto::SessionChildArtifactPreview {
+            id: "subagent".into(),
+            preview: preview("subagent-fp"),
+        }],
+    };
+    let value = serde_json::to_value(&family).unwrap();
+    assert_eq!(value["children"][0]["id"], "subagent");
+    assert_eq!(
+        value["children"][0]["preview"]["fingerprint"],
+        "subagent-fp"
+    );
+    let decoded: wisp_dto::SessionFamilyArtifactPreview = roundtrip(&family);
+    assert_eq!(decoded, family);
+}
+
+#[test]
+fn assistant_weixin_status_contract_is_separate_from_legacy_channels() {
+    let status = wisp_dto::AssistantWeixinStatus {
+        enabled: true,
+        bound: true,
+        state: "running".into(),
+        detail: "connected".into(),
+    };
+    let dto: wisp_dto::AssistantWeixinStatus = roundtrip(&status);
+    assert!(dto.enabled && dto.bound);
+    assert_eq!(dto.state, "running");
+    assert_eq!(
+        serde_json::to_value(wisp_dto::WeixinDestination::Assistant).unwrap(),
+        "assistant"
+    );
+    assert!(serde_json::from_str::<wisp_dto::WeixinDestination>("\"invalid\"").is_err());
+}
+
+#[test]
+fn skill_rows_carry_scope_copies_and_install_receipts() {
+    let copy = |scope: &str, effective: bool| wisp_dto::SkillCopy {
+        scope: scope.into(),
+        dir: format!("/{scope}/notes"),
+        effective,
+        same_as_effective: true,
+    };
+    let backend = crate::SkillInfo {
+        name: "notes".into(),
+        description: "Notes".into(),
+        tags: vec![],
+        scope: "project".into(),
+        enabled: true,
+        builtin: false,
+        managed: false,
+        managed_by: None,
+        dir: "/project/notes".into(),
+        copies: vec![copy("project", true), copy("global", false)],
+    };
+    let row: wisp_dto::SkillRow =
+        serde_json::from_value(serde_json::to_value(&backend).unwrap()).unwrap();
+    assert_eq!(row.copies, backend.copies);
+    let legacy: wisp_dto::SkillRow = serde_json::from_value(json!({
+        "name": "old", "description": "", "enabled": true, "builtin": true, "dir": "/old"
+    }))
+    .unwrap();
+    assert!(legacy.copies.is_empty());
+
+    let receipt = wisp_dto::SkillInstallReceipt {
+        name: "notes".into(),
+        scope: "global".into(),
+        dir: "/global/notes".into(),
+        shadowed_by: Some(copy("project", true)),
+    };
+    let decoded: wisp_dto::SkillInstallReceipt = roundtrip(&receipt);
+    assert_eq!(decoded, receipt);
+}

@@ -1,0 +1,1062 @@
+# Agent delegation
+
+Delegation lets the main Agent create a bounded set of temporary sub-Agents,
+run independent work in parallel, and synthesize their evidence either in the
+same turn or after durable background completion. Codex and ACP are optional
+executor choices; neither is part of the meaning of a code-capable Agent.
+
+## Quick Actions and Workflow templates
+
+Quick Actions are contextual entry points for selected text. Custom actions
+instantiate reusable Workflow templates: they persist the resolved
+authorization snapshot and start the same scheduler shown in the Agents panel.
+The built-in **Research literature** action is deliberately different: it
+prepares a Skill-backed turn in the current conversation so progress and the
+final result remain in that conversation's durable transcript.
+
+Manage these two layers in Settings:
+
+- **Quick Actions** controls the label, enabled state, and selected-text
+  trigger. Custom actions also choose a bound Workflow; **Open Workflow** jumps
+  directly to that graph.
+- **Workflows** opens the standalone Workflow Studio. A template stores its
+  goal, shared context, approval policy, Subagent tasks, dependencies,
+  capabilities, Specialist/executor/model choices, budgets, and output
+  schemas. Tasks without dependencies may run in parallel; dependencies define
+  the serial stages.
+
+The Studio uses the same task contract and proposal type as runtime delegation.
+The right-panel Agents view is intentionally an activity surface rather than a
+second workflow editor.
+**Literature evidence review**, **Roundtable**, and **Develop computational
+method** are read-only built-in Workflows in its library. The Roundtable generator is also available for
+custom variants: it expands two or three participants plus a chair into
+ordinary parallel opening, cross-review, and synthesis tasks. The generated
+nodes remain editable and can be saved as a reusable Workflow, then bound to
+one or more Quick Actions.
+
+The Subagent graph is the primary composition surface. It assigns every task
+to a topological stage: nodes in the same column are independent and may run
+in parallel, while arrows move left to right through dependent stages. Select
+a node to edit its complete task contract in the inspector. Drag from an
+output handle to a downstream node (or click the handle then click the target)
+to create a dependency; use **Add after selected** to insert the next stage
+directly after the current node, or **Add parallel node** (toolbar or
+double-click empty canvas) for same-stage peers. Click an arrow to select it,
+then click again or press Delete to remove the dependency; incoming dependency
+chips in the inspector still work too. Nodes can also be added or deleted
+directly on the canvas. Every graph interaction updates the ordinary
+`depends_on` proposal fields immediately, and cycle-producing connections are
+rejected before save.
+
+Workflow Studio replaces the normal Settings chrome with a dedicated
+full-window editor. The template library stays on the left, the DAG canvas in
+the center, and **Workflow configuration** on the right. Goal, approval policy,
+and shared context live in a collapsible section alongside the canvas. Save and
+lifecycle controls stay in the top bar. No node is selected initially. A single
+click shows a read-only task summary at the bottom of the right column without
+resizing the canvas. Double-click a node (or choose **Edit node** in its summary)
+to edit instructions, capabilities, output contracts, Specialist, executor and
+model in a modal. Closing the modal keeps the selected-node summary and returns
+focus to the node; edits stay in the workflow draft until Save Workflow. Source
+Skills are selected in the conversion dialog, not bound to executable nodes.
+
+The library has a single **New workflow** button. It opens a dialog with **Blank**,
+**From a template**, and **From Skills**. Blank starts with one empty task; a
+template creates an editable copy; From Skills opens the existing conversion
+workspace.
+Cancelling the dialog preserves the current draft. The configuration panel no
+longer contains a Roundtable generator; Roundtable is available in the template
+chooser alongside other workflows.
+
+On desktop, drag the inner edges of the library and configuration panels to
+adjust their widths, or focus a separator and use the left/right arrow keys.
+Panel widths are bounded to keep the graph usable; narrow windows keep the
+stacked layout. When saving is unavailable, a message below the header explains
+the missing field or invalid task. Successful saves show a confirmation toast;
+backend errors stay visible in the editor. Deleting a custom workflow requires
+confirmation in a dialog naming the saved workflow. Cancel, clicking outside,
+or Escape dismisses only that dialog and preserves the workflow and draft.
+
+The composer `/` picker searches both enabled Skills and Workflow templates.
+Selecting a Workflow adds a typed Workflow chip instead of copying prose into
+the message. On send, Wisp resolves the template by stable ID, injects its
+exact DAG contract, and enables delegation for that native conversation so
+the main Agent can execute the graph through `delegate_tasks`. Skill and
+Workflow chips can be combined in the same turn; transcript cards retain both
+selections after reload. Removed or unavailable templates fail closed instead
+of silently falling back to an invented plan.
+
+The first built-in action is **Research literature**. Select text in a
+conversation or a non-code file preview, then choose the action from the
+floating selection toolbar or the right-click menu. R and Python source
+selections keep Run / Ask AI / quote / explain instead. Wisp attaches the
+selection and the `literature-review` Skill to the current composer, adds an
+editable prompt that asks for verified supporting and conflicting evidence,
+and focuses the composer. Review or extend the request, then send it
+normally. The Agent's
+tool activity, progress, interruptions, and result now use the current
+conversation instead of a separate side-panel lifecycle, so switching away
+after sending and returning does not discard the research transcript.
+
+The read-only **Literature evidence review** Workflow remains available in
+Workflow Studio for users who explicitly want its three-node parallel search
+and synthesis graph.
+
+Quick Action records are persisted separately from templates. Their label,
+enabled state, and menu ordering are user-controlled; the built-in action's
+current-conversation routing and Skill binding stay pinned to compiled values.
+Built-in Workflow templates are read-only; saving an edited built-in creates a
+custom copy.
+
+For custom actions, selected text and its source are appended to the template's
+shared context as explicitly untrusted content. A custom Workflow uses the
+normal approval policy: `review_all` creates a draft in its dedicated
+conversation, while `auto_safe` starts only when the resolved graph does not
+require confirmation. Write, execute, network, external-service, isolation,
+and elevated-budget requests therefore continue through the normal review
+boundary.
+
+## Inline temporary Agents
+
+### Watching parallel exploration
+
+The WebView desktop shows an **Agent swarm** progress card above the composer
+for `map_items`, project/session Reader retrieval, and `explore`. Open **View
+assistants** to see the three stages: starting tasks, parallel execution, and
+summary. The compact card shares the input box's column and shows a phase badge,
+task counts, and a thin strip of observed task states. The full stage list stays
+inside the exploration window. Finished cards have a close button: hiding the
+card leaves its results available under **Agents → Parallel tasks**, which also
+shows the current live batch. Open that entry to inspect per-task progress and
+results, or use **Stop this turn** while it is running. This stops the whole
+conversation turn; individual chunks cannot be stopped on their own. Hiding
+applies to the current app window and survives switching conversations; a new
+batch shows a new card. The panel uses the existing latest batch snapshot, not
+a new history of all batches.
+
+### Retrying failed Reader tasks
+
+When a Reader batch finishes with gaps, the card, the **Agents** entry, and the
+exploration window offer **Retry failed tasks (N)**; a failed assistant's own
+page offers **Retry this task**. A retry continues the same batch in place: the
+chosen assistants go back to work, only their failed transcript chunks are
+re-read (an older snapshot without chunk bookkeeping re-reads the whole saved
+conversation), and the batch ends as complete or still partial depending on
+what remains. **Stop this turn** cancels a running retry. The recovered
+evidence is not sent to the model on its own; it is added, under a
+**Reader retry** heading, to the context of the next message in that
+conversation, whether or not that message references the project again. Only
+one retry runs per conversation at a time, and a retry is refused while a turn
+is running. `map_items` and `explore` batches are not retried from the panel:
+ask the assistant to resume the batch instead.
+
+The overview separates the task description from
+the total, working, completed, and failed counts; long paths wrap as body text.
+Partial results use an amber status badge, while failed tasks retain their red
+counts and strip segments. The animation follows actual execution events; it
+does not estimate completion time or invent a percentage. Select a task to read
+its instruction, recent tool/progress observations, and result preview. Reader groups transcript
+chunks by saved conversation and shows completed/total chunks for each one.
+An invalid or incomplete Reader JSON response triggers one retry with shorter
+output. Its progress entry stays on the same chunk; a recovered retry counts
+as one completed chunk, and a chunk is marked failed only if recovery fails.
+Each assistant with several chunks shows a thin bar of completed and failed
+chunks, and the six nodes of the overview illustration mirror the state of the
+first six assistants.
+Private model reasoning is not included. The selected assistant is highlighted
+and exposed as selected to assistive technology. Text follows the global UI font
+size setting on both desktop and narrow windows.
+
+Completed, failed, queued, paused, and stopped tasks have separate states.
+**Stop this turn** uses the existing conversation cancellation; closing the
+view only hides it. Escape returns from task detail to the overview, then
+closes the view on the next press. Reduced-motion preferences disable the
+animations. Task lists load in groups of 80; details retain the latest 12
+observations and an 8,000-character result preview. Full `map_items` results
+remain in its existing rows/CSV/reduce files.
+
+Switching conversations preserves the current batch view. Start and final
+snapshots are saved with the conversation; after an app restart an unfinished
+saved snapshot is shown as paused, never as a still-running animation. Reader
+progress is available live during preparation and its final snapshot is saved
+before the main turn. A resumed `map_items` call starts a new view with already
+finished items restored. This display does not change worker concurrency,
+Reader's search scope/time budget, or approval policy. Workflow delegation and
+watch-only child conversations retain their existing entries alongside the
+parallel batch in the Agents panel.
+
+中文：`map_items`、项目／会话 Reader 和 `explore` 共用“并行探索”视图。
+聊天输入框上方的紧凑卡片与输入框对齐，显示阶段标签、任务计数与按真实状态分段的
+细色条；完整三阶段导航保留在弹窗内。点击“查看助手”可查看每项任务的进展与结果。
+已结束的卡片可以关闭，结果仍保留在 **Agents → 并行任务**。该入口也显示当前正在
+运行的批次，可以打开详情或“停止本轮”；停止会取消整个会话轮次，不支持单独停止
+或重跑 Reader 分块。关闭状态在当前窗口切换会话后仍保留，新批次会重新显示卡片；
+Agents 展示当前会话最近一个批次的快照。
+弹窗总览把任务说明与状态统计分开，长路径按正文换行；部分失败显示琥珀色阶段标签，
+失败项的计数与色条保持红色。任务详情将说明、执行进展和结果分区展示。
+Reader 按历史会话分组显示扫描分块数。JSON 格式错误或内容不完整时，会在原分块
+内自动重试一次，并显示重试进展；恢复成功只计为一个完成分块，重试仍失败才记为
+失败。动画由实际事件驱动；失败、暂停与停止
+不会显示为全部完成。关闭视图不取消工作，“停止本轮”沿用现有停止行为。
+`map_items` 续跑时保留已经完成的项目，完整结果仍在原有输出文件中。
+
+Manual verification: run a small approved `map_items` batch with two concurrent
+items and a reduce step; open the card immediately, inspect a running task,
+press Escape twice, and reopen it during reduce. Repeat with one unreadable
+input and with Stop/resume. Attach a few saved sessions to verify Reader
+progress appears before the primary response. Check a narrow window, dark
+theme, reduced motion, a larger UI font size, and switching away/back while tasks
+are running. Select a worker and return to the overview; its selected state
+should clear without closing the window.
+Check a Reader batch with a long request and mixed results: the dock should align
+with the input box in both normal and split views, the description should wrap
+without widening the window, and failed counts must remain separate from
+completed counts. At narrow widths, the roster sits above the detail and the
+overview counts use two columns.
+Close a finished dock, switch away and back, then reopen the results from
+**Agents → Parallel tasks**. A new batch should restore the dock. For a running
+batch, confirm that the panel's stop action targets the current conversation
+and that one Escape closes only the overlaid exploration view.
+
+1. Delegation is always available to a built-in conversation, like Skills and
+   MCP tools: there is no per-conversation switch to enable first, and the
+   composer Agent menu has no delegation settings. The main Agent decides per
+   call whether a batch returns in the same turn or in the background (see
+   [Background completion](#background-completion)).
+2. Use `delegate_tasks` for a bounded graph with known dependencies and
+   deliverables. For sustained exploration that inspects inputs, revises
+   scripts, waits for compute Runs, reviews results, and needs follow-up
+   instructions, the Agent prefers `dispatch_subagent` when available. An
+   explicitly selected Workflow template still runs through `delegate_tasks`,
+   including a single-node template; task count alone does not select a tool.
+   Background delivery changes when a workflow returns, not its time or budget
+   limits. Small tasks stay in the current conversation.
+3. The call describes an overall goal, bounded shared context, and up to eight
+   tasks. Each task has its own instruction, dependency IDs, capability IDs,
+   optional Specialist, optional JSON output schema, optional isolation
+   request, and optional per-task token/tool/cost budget. Budgets are an
+   advanced tuning knob: tasks run unlimited by default, and an omitted or
+   zero dimension stays unlimited. The local desktop host also leaves aggregate
+   token/tool/cost budgets and wall deadlines unlimited by default; it does not
+   add an implicit 256,000-token batch cap or a 600-second task deadline.
+   Explicit task limits and managed/nested host ceilings still apply. The
+   activity card renders a zero aggregate limit as **unlimited**, while continuing
+   to count usage normally.
+4. Wisp resolves every capability through host policy into an exact model,
+   executor, tool set, project scope, workspace policy, budget, and timeout.
+   The model cannot grant raw tools or permissions to a child.
+5. Safe read-only tasks run immediately. A batch that can write, execute code,
+   use an external service, request isolation, or explicitly request an
+   elevated budget uses the existing approval prompt. Rejecting it starts no
+   child and returns the feedback to the main Agent so it can revise the
+   batch.
+6. Independent tasks run concurrently up to the batch limit. A dependent task
+   starts only after its direct dependencies succeed and receives their
+   structured results. An unrelated branch continues after another branch
+   fails; only descendants of the failed branch are blocked.
+7. Ordered, compact results return as tool output. The main Agent must combine
+   them into its final response rather than sending the user elsewhere. If a
+   result was truncated, `get_delegated_result` reads that task's full persisted
+   result for the same conversation.
+
+Delivery parsing is tolerant. A child's final message may wrap the requested
+JSON in a Markdown fence or narrative text; Wisp extracts the embedded JSON
+payload. When a non-reviewer child finishes but its final message still cannot
+be parsed as the requested shape, or its parsed value does not satisfy the
+task's output schema, the completed work is preserved instead of discarded:
+the raw text (or non-conforming value) is delivered with a
+`delivery: {degraded, reason}` marker, the task counts as succeeded, and
+dependent tasks receive the degraded result rather than being blocked.
+Consumers must treat a degraded delivery as raw evidence, not contract-shaped
+data. Independently converted nodes have strict success/artifact contracts and
+fail when those contracts are not met; they never use this degraded-success path. Reviewer verdicts are exempt: a reviewer result that is not a JSON
+object with a summary (and, for standard reviews, a findings array) still
+fails, because review gates must not be satisfiable by unparseable output.
+
+Failed and cancelled workflows are resumable. **Retry** keeps the persisted
+workflow and every successful task result, reruns only failed/cancelled tasks
+and descendants that were blocked, then supplies the retained dependency
+results to those descendants. A failed or cancelled task exposes its current token limit in
+the activity card; changing **Retry max tokens** before retrying revises only
+that task's authorized budget on the same workflow (0 makes the task
+unlimited). A finite value is still checked against capability and host
+ceilings; a rejected budget names the triggered limit, the requested value,
+and the ceiling.
+
+Each root retry opens a fresh execution round after the previous attempts have
+stopped. The round's wall clock starts when execution actually begins, so draft
+review and approval wait do not consume it. Root time and budget allowances are
+scoped to that round across its descendants; old nested tasks, usage and
+cancellation flags cannot stop the retry. Previous attempts and their costs
+remain in history, and already successful task results are reused. The Agents
+card shows the current round's token/tool allowances alongside cumulative
+usage, and reports the actual stop cause (timeout, user cancellation or
+budget exhaustion). A failed Run harvest is recovered from the Run's outputs;
+retrying a workflow node may execute its code again.
+
+When retrying a workflow created with the old desktop defaults, Wisp refreshes
+the inherited 600-second task deadlines and the matching generated root limits
+in the same transaction that starts the new execution round. An explicitly
+requested timeout (including an explicit 600 seconds), task budget, or custom
+root limit is retained. Successful results and previous attempts are retained.
+Already approved snapshots keep their saved limits until retried. A retry still
+starts a new context for a failed Native task; it does not automatically resume
+that task's interrupted conversation or reclaim usage missing from old records.
+
+For newly executed Native tasks, usage from completed model requests survives a
+hard timeout and is saved with the failed attempt, together with its child
+conversation reference. An interrupted request that has not returned usage
+cannot be counted yet. HTTP 200 stream error envelopes containing recognized
+upstream EOF/connection-reset/timeout failures use the existing bounded model
+retry policy; authentication, billing, and invalid-request errors remain failures.
+
+Manual verification after building: retry a legacy failed desktop workflow with
+one successful task and one task using the old implicit deadline; confirm the
+successful result is reused, the new round shows unlimited default allowances,
+and an explicitly configured timeout/budget remains finite. With a mock model,
+interrupt a task after a completed tool round and confirm its nonzero usage and
+child conversation remain visible. Verify the Agents card in both languages.
+
+Omitting `specialist_id` creates a generic temporary Agent. Selecting a
+Specialist reuses its persona, model preference, and connector
+restrictions as an immutable snapshot for that run. A Specialist is therefore
+an optional preset, not a required fixed team slot. The parent Agent sees only
+the currently available Specialist IDs, names, and descriptions; private
+instructions are copied into the selected child snapshot, not exposed in the
+`delegate_tasks` description. The child prompt is composed from the bounded
+worker contract, Specialist identity/instructions, task context and dependency
+inputs, then the result contract.
+
+A valid Specialist model preference is used when the task resolves to Native.
+An empty or deleted model binding falls back through the subagent model
+selection below and the resolved model is persisted. ACP profiles remain
+executor choices rather than Specialist model bindings. The built-in Reviewer
+follows the same optional selection rule and is never appended to a dynamic
+plan automatically.
+
+### Subagent model
+
+Temporary Agents and subagent conversations do not have to run on the
+conversation's own model. A high-end chat model can keep the planning and
+synthesis while bounded reading, extraction and drafting go to a cheaper
+worker. The model a child runs on is resolved in this order:
+
+1. A concrete override on the task (Workflow Studio editor) or the Specialist's
+   own model binding.
+2. The conversation's **Subagent model** choice from the agent menu in the
+   composer: a profile, or *Follow this conversation*.
+3. The global **Default subagent model** in Settings → Specialists. It outranks
+   the conversation model on purpose: setting it once keeps every worker off
+   the expensive model without touching each conversation.
+4. The conversation's model.
+
+The parent Agent never sees profile ids. When the resolved worker model differs
+from the conversation's model, `delegate_tasks` tasks and `dispatch_subagent`
+accept an optional `model_tier`: `fast` (the default, the worker model) or
+`inherit` (this conversation's model, for a task that needs its full
+capability). `inherit` is a preference like a Specialist binding: a task that
+requires vision on a text-only conversation model still falls through to an
+eligible profile. Nested delegation keeps pinning children to their parent's
+one model. The Agents panel lists the resolved model on every task and on each
+subagent conversation.
+
+## Roundtable template
+
+Choose **New workflow → From a template → Roundtable** to create a copy of the
+built-in five-task graph: two parallel opening positions, two cross-reviews,
+and a neutral chair synthesis. Edit the goal and double-click each node to customize
+its instructions, Specialist, executor, model, capabilities and output contract.
+The task instructions are copied from the template; changing the workflow goal
+does not rewrite them. Add nodes and dependencies for additional perspectives.
+
+This is a bounded DAG, not a live multi-model group chat. Temporary children do
+not share hidden transcripts or freely message peers; dependency results are
+their explicit coordination channel. The normal resolver, approval screen,
+executor availability checks, persistence, cancellation, and audit records
+still apply.
+
+## Background completion
+
+`delegate_tasks` runs inline by default, with the same-turn behavior above.
+For long work the user should not wait on, the main Agent sets
+`background: true` on that call; there is no per-conversation setting. A
+background call returns a workflow handle as soon as the approved batch is
+scheduled, so the parent turn and the rest of the app can continue. The main
+Agent must not poll that handle. A delegated child Agent cannot start a
+background batch, because nothing would resume it: the nested tool schema does
+not offer `background`, and a nested call that sets it is refused before any
+workflow is created.
+
+Workflows started outside a parent model turn use the same durable background
+delivery path. These include Quick Actions and Workflow runs approved or
+retried from the Agents panel.
+
+Each background execution reserves a persisted generation before any child
+starts. When the workflow reaches succeeded, failed, or cancelled, Wisp stores
+one compact result for that generation. Under the same conversation lock used
+by normal turns, it then atomically appends one internal result message and
+marks the generation delivered. A busy parent finishes its current or already
+queued user turn first; this prevents background delivery from racing the
+turn's incremental message sequence. Retrying a failed or cancelled workflow
+creates a new generation, so the retry can deliver once without redelivering
+the earlier result.
+
+Every background generation resumes its parent: once the result is
+delivered and the parent Agent is idle, Wisp starts one synthesis turn without
+another user message. Several completions that become ready together may be
+combined into one synthesis turn, but each generation's resume claim is made
+only once. If the app stops after claiming that turn, the claim is recorded as
+interrupted instead of being silently replayed on restart. Generations
+recorded before resumption became automatic keep their original choice; their
+completion card enters the Native parent's context on its next turn. ACP
+parents receive the result as internal context on their next prompt because
+their own transcript is maintained by the external Agent.
+
+On startup, queued/running child attempts become explicit failed attempts, and
+a background generation reserved before its first child started becomes an
+explicit failed workflow. Terminal generations that were persisted just before
+a crash are reconstructed from their immutable plan and attempts, then
+delivered normally. The compact conversation message may later be removed by
+ordinary transcript retention; full task responses and lookup records remain
+in workflow attempts.
+
+## Host-managed Run activities
+
+A Workflow may contain a bounded host-managed `run_activity` node in addition
+to ordinary Agent nodes. The first supported activity is `method_search`.
+Workflow remains an immutable DAG: candidate iteration happens inside one
+persisted Run and never expands the approved graph.
+
+Run activities have their own exact authority snapshot: activity version,
+ExecutionContext revision, one direct dependency and structured output
+pointer, candidate/time/evaluator/cost limits, provider/model profile IDs, and
+integrity hash. Specialist, Agent executor, Skill, isolation, model override,
+and Agent token/tool budgets are rejected on these nodes. A method-search node
+may consume only the required
+`method_search_spec_artifact_version_id` field declared by its direct
+dependency's output schema.
+
+After its attempt starts, Wisp atomically creates and links the Run and moves
+the attempt to `waiting_run`. That state is unfinished for DAG dependencies but
+does not occupy one of the root Agent concurrency slots. Descendants remain
+blocked until the linked Run succeeds. Run failure, timeout, loss, or
+cancellation maps to one terminal attempt exactly once; retry creates a new
+attempt and a new Run.
+
+For `method_search`, creation stops at a second, exact review boundary. The
+linked Run is `Draft`, the provider is not called, and no candidate evaluator
+runs. The Run detail shows the immutable spec and audit ArtifactVersion IDs,
+target symbol, evaluator, baseline/noise summary, reachability result,
+guardrails, protected inputs, ExecutionContext, and budgets. **Start search**
+revalidates those frozen inputs plus the approved model profile and only then
+moves the Run to `Submitted`. This review is distinct from approving the
+Workflow plan: plan approval authorizes preparation; Run start authorizes
+search against the exact contract that preparation produced.
+
+The method-search Run surface reports bounded progress and candidate lineage,
+and provides pause, resume, and cancel controls. A pause takes effect at a
+durable candidate boundary. Resume revalidates the exact contract and context;
+it never silently substitutes current files. Selected code remains an
+ArtifactVersion and is not applied to the project checkout.
+
+Startup recovery keeps `waiting_run` only when its dedicated Run link still
+exists in the same project. A missing or mismatched link fails explicitly.
+Project import always fails an imported waiting activity instead of guessing
+that work on another device can resume; the Run link and prior evidence remain
+available for inspection. Cancelling the root requests cancellation of both
+active Agent attempts and linked Runs. Graceful desktop shutdown converts a
+submitted/running local method search to `Paused` after its last durable
+checkpoint and terminates the bounded evaluator with the application. Startup
+also converts an interrupted search to `Paused` with a recovery note. Both
+paths require an explicit resume.
+
+Method-search v0 is deliberately local and serial: Python only, one declared
+function/class target, one local ExecutionContext, 1–50 candidates, immutable
+project-local inputs, and a bounded evaluator. It does not provide GPU/remote
+scheduling, multi-target repository edits, automatic data downloads, or
+automatic application of the selected method.
+
+## Native, ACP, and code execution
+
+Native execution runs the ordinary Wisp Agent loop in a separate child
+conversation with only the resolved tools. It supports project reading,
+project writing, and bounded Run Manager execution without starting an ACP
+client. This is the default eligible executor and is enough for a code task.
+
+Scientific resources are resolved for the owning project and conversation at
+draft time, then checked again before execution. Wisp considers the project's
+enabled bundled/custom MCP connections, selected
+ExecutionContexts, configured Python/R interpreters, runtime workers, and
+vision-capable models. A disabled or missing resource is omitted from both the
+editor and `delegate_tasks` schema instead of being advertised optimistically.
+Changing this resource set invalidates an already approved authorization
+snapshot, so the task must be reviewed against the new authority.
+
+The initial resource mapping is deliberately capability-shaped:
+
+- `literature_search` requires enabled, authorized literature connectors.
+  Installing or binding a Skill never satisfies an execution resource.
+- `external_research` grants only enabled non-literature MCP connections.
+- `visualization` grants configured Python/R tools.
+- `code_run` grants `run_in_context`, `get_run`, and `cancel_run`. A generic
+  temporary task does not inherit parent Skill tools or load Skill guidance
+  at runtime.
+- `image_inspection` grants local image reading only when the selected Native
+  model supports vision.
+
+For every task, its capability grant and its immutable Specialist whitelist
+must both allow a connector. `None` on a selected Specialist keeps
+the existing “inherit project settings” behavior; an explicit list narrows it.
+The resulting exact resource IDs are installed directly in a Native child or
+encoded as private allowlist tokens for that ACP child's filtered Wisp MCP
+bridge. They are not inferred from an ACP vendor, command name, or Agent label.
+Native children discover granted MCP tools through `search_mcp_tools` and call
+them through `use_mcp_tool`; the child approval boundary authorizes both those
+gateway names and the exact hidden tool targets from the resolved connector
+grant.
+
+ACP profiles remain available to workflows that explicitly resolve to an ACP
+executor. Every configured profile whose command is currently available is
+listed separately, and the selected profile ID—not its command, label, model,
+or task name—controls routing. A profile may use Codex or another compatible
+Agent, but the task is still defined by capabilities and contracts, not by an
+ACP or Codex template. Automatic selection continues to prefer Native whenever
+Native satisfies the task; choosing ACP is an explicit, approval-visible
+override.
+
+Delegated ACP sessions start with no Wisp MCP bridge. Wisp adds only bridge
+tools implied by the resolved task permission set; for example, `code_run` can
+receive the project-scoped execution-context and Run Manager tools while a
+reasoning or file-read task receives no bridge. ACP permission requests are
+matched against the same resolved tools, write flag, and project path ceiling,
+independent of the ACP vendor. Unknown command, process, MCP, and network
+requests are rejected.
+
+Long-lived code is submitted as a persisted Run rather than by increasing the
+delegated shell timeout. The child receives the conversation's selected remote
+contexts plus the always-available local context, and can query or cancel the
+Run by ID. Direct `shell` is never registered for a delegated Native child;
+ACP receives the same Run control plane through the filtered bridge.
+
+When a child links a project-local output in its structured summary or
+evidence, Wisp snapshots the file as a content-addressed Artifact and returns
+its durable ID with the task result. Structured DataAsset and Paper references
+remain JSON references in the persisted response and parent delivery; large
+or binary payloads are not copied into the conversation. A configured custom
+MCP connection is treated as available from its saved configuration, but a
+connection failure at execution is still reported by the child because Wisp
+does not perform network health checks while drafting.
+
+The same inline delegation surface is exposed through the Wisp MCP bridge as
+`wisp_delegate_tasks` and `wisp_get_delegated_result` when the owning
+conversation opted in. Because that bridge is non-interactive, a batch that
+requires approval is denied instead of silently escalating.
+
+## Bounded nested delegation
+
+Nesting is opt-in per task through the `delegation` capability. A task that was
+not resolved with that capability never receives `delegate_tasks`, even if its
+prompt asks for it or a stored/raw tool name is forged. An authorized Native
+or ACP child receives the same dynamic task protocol with authority narrowed
+to its own capability, model, executor, permission, context, budget, and
+timeout snapshot.
+
+The default root limit remains one Agent level. Selecting `delegation` raises
+that workflow to the hard maximum depth of two: a root child may create one
+temporary child batch, and a depth-two child cannot delegate again. Root-wide
+limits cover at most eight total tasks, two concurrent active children, and
+the aggregate token, tool-call, cost, and wall-clock budgets. Registration and
+attempt start reserve these limits atomically before a backend child or ACP
+process is created. While an authorized parent waits synchronously for its
+children, it yields its concurrency slot and reacquires it before continuing.
+
+Nested task display IDs are namespaced under the parent, such as
+`analysis/check_data`, while database workflow, step, and attempt IDs remain
+stable. Root cancellation, deadline expiry, and budget exhaustion propagate to
+every descendant. Completed nested batches are stored as structured results on
+the direct parent response and are included again in the compact root result,
+so synthesis does not depend on parsing a child transcript. Lineage and result
+lookup survive application restart. Peer-to-peer sibling messaging is not part
+of this model; dependencies, persisted artifacts, and parent result rollup are
+the coordination paths.
+
+## Batch map over many items
+
+When the *same* task repeats over N items (screening 100 papers, extracting one
+table from 50 PDFs) use `map_items` instead of `delegate_tasks`: one approval,
+a frozen item list, bounded concurrency, resumable rows, and an optional
+decision-model pass/reject decision. See [map-items.md](map-items.md).
+
+## Subagent conversations
+
+Use a subagent conversation for evolving research work, such as checking
+candidate sequences, developing an analysis script on a selected server,
+reviewing its results, and revising it. The parent can answer questions and
+send further instructions to the same child. Computation still uses managed
+Runs, and a completed Run's outputs can be recovered without repeating the
+computation. A workflow remains appropriate when its task graph and expected
+deliverables are already defined or the user explicitly selected a template.
+
+For a bounded second opinion during a difficult turn, configure an
+[on-demand expert model](model-configuration.md#on-demand-senior-experts--按需求助高级模型).
+The `consult_expert` subagent returns advice directly to its parent and appears
+in the Agents pane. It has no tools and does not create a watch-only conversation.
+
+A conversation's Agent can also start a **subagent**: a conversation of its own
+for one focused task, such as "open a new conversation and do X there". Unlike
+the temporary sub-Agents above, a subagent is unbounded by a task plan, visible
+in the sidebar under the conversation that started it (marked with a robot icon), and
+watch-only for the researcher: opening it shows the live transcript, but the
+composer is locked and the backend refuses any message, queued follow-up,
+cut-in, timer, rewind or undo that does not come from the parent conversation.
+Each instruction from the parent appears in the transcript as a task card headed
+**From the parent conversation's agent**; the fixed subagent framing the model
+receives is hidden there, though **Copy** still copies the full text.
+Subagents inherit their parent's folder, and moving the parent moves its
+persisted subagent/branch subtree, including conversations outside the loaded
+sidebar page. Older subagents with mismatched folder metadata still nest under
+their visible parent.
+
+Deleting the parent asks what happens to its subagents, branches and
+explorations, nested ones included. **Also delete its subagents, branches and
+explorations** is checked by default; it discards the open exploration rounds
+they started and deletes those conversations with the parent. Unchecked,
+subagents and branches stay as standalone, writable conversations. An open
+exploration round cannot outlive its source conversation, so with one present
+the deletion requires the box to stay checked.
+
+**Also delete associated artifacts and files** follows that choice. With the
+children deleted too, the preview lists the parent's and every deleted
+subagent's and branch's artifacts, and toggling the children box refreshes it;
+unchecked, it previews the parent alone. Because the whole family goes, a
+reference from one of its conversations does not keep another one's file: a
+figure a subagent produced and the parent linked is deleted rather than kept as
+shared. Each conversation is checked against its own reviewed preview before
+any of them is deleted, then deleted deepest first with the files it reviewed,
+so a stale preview deletes nothing and asks for a fresh one. A subagent
+selected together with its parent is deleted, files included, as part of the
+parent's family. When the selection already holds every subagent and branch,
+for example after **Select all** in the sidebar, there is nothing left to keep
+and the children box is not shown, but the family is still previewed and
+deleted as one, from its top selected conversation, rather than conversation
+by conversation.
+
+Each dispatch binds the child to the resolved subagent model (see "Subagent
+model" above): the conversation's choice, else the global default from
+Settings → Specialists, else the parent's chat model. When that is the
+parent's own model, or the parent passes `model_tier: "inherit"`, the parent's
+reasoning effort and service tier come along; a different worker model runs on
+its own profile defaults instead. Switching either model takes effect at the
+next dispatch.
+
+Each initial dispatch and follow-up also synchronizes the parent's selected
+execution contexts and resolved default compute target to the child. A server
+selected in the parent, such as `ssh:CPU3`, is therefore available for explicit
+`run_in_context`, Python and R calls in the child. Parent context removals take
+effect on the next dispatch; unrelated child selections and the global default
+captured when the child was created are replaced. This copies context selection,
+not credentials or Full Permission. A follow-up refreshes an existing child's
+runtime wiring, so the parent can resolve missing context without asking the
+researcher to configure the watched child manually.
+
+The parent's model reviews subagent tool approvals against the originating
+user request and exact operation. Routine operations within that authorization
+can be approved once automatically. Missing details, ambiguous effects or an
+unavailable reviewer produce a confirmation card in the parent conversation;
+the original card remains actionable in the child. Decisions are bound to the
+exact approval ID, and resolving either card clears its counterpart.
+
+The child stays watch-only for messages, but its **Full Permission** control
+above the composer and in **Agent options** remains available. Enabling it
+requires the usual confirmation and applies only to that child until revoked
+or the app restarts; it also releases an already waiting ordinary approval.
+The confirmation keeps its target conversation if the user navigates while
+it is open. The parent's Full Permission does not grant it to the child.
+
+The parent conversation gets three tools:
+
+- `dispatch_subagent` starts a subagent with a self-contained instruction, or
+  sends a follow-up to an idle one it started (`session_id`). It returns once the
+  subagent accepts the instruction, after synchronizing the parent's model and
+  execution contexts.
+- `subagent_status` reports whether a subagent is running and its latest
+  answer; without `session_id` it lists this conversation's subagents.
+- `stop_subagent` cancels a subagent's running turn.
+
+The right-panel **Agents** view lists every subagent of the current
+conversation, whichever mechanism ran it: child conversations started with
+`dispatch_subagent`, `explore` runs (folded into one "Quick explorations"
+group once finished, since they take seconds), and `delegate_tasks` workflows
+below them. Rows split into in progress and completed. Opening a row shows the
+subagent's status, instruction and final answer in place; a child conversation
+can be stopped or opened in the chat from there, and an explore run names its
+archived trace file. Escape returns to the list. The pane never switches to
+itself when a subagent starts.
+
+When a dispatched turn ends, including when it ends with a question, a
+background callback reviews the result with the parent's model and appends a
+separate summary to the parent conversation; no polling is needed. After a
+normal child turn, the parent automatically continues under its conversation
+lock to handle the child's questions, missing resources and follow-up work.
+The parent uses available context and existing user authorization first, and
+asks the researcher in the parent conversation, with `ask_user`, only when new
+information or authority is required, such as installing software, granting
+access or choosing between options. The continuation keeps the original user request
+separate from the child's result; it does not create a synthetic human message
+or treat the child's proposed actions as permission. It retains the original
+remote-message approval policy.
+
+A subagent cannot ask the researcher itself, so its framing tells it to hand
+such blockers back: installing software or packages beyond one project-local
+attempt, administrator rights, credentials or access, system-wide or network
+settings, and choices that belong to the researcher. It stops at the first one
+and names what is needed and the exact command or options, instead of retrying
+variants until its step limit.
+
+A child turn that still reaches its step limit also resumes the parent, but
+that turn cannot dispatch: the parent reports what the child completed and what
+blocked it, then asks the researcher with `ask_user` whether and how to
+continue. The child runs again only after the researcher answers, because the
+researcher cannot continue a watch-only child and an automatic restart could
+loop through the limit again (#1645).
+
+Cancelled or failed turns produce a report without an
+automatic restart. A cancelled parent, a deleted conversation, changed ownership,
+or a child that has already started newer work does not act on a delayed request. An
+archived parent keeps the report without resuming; automatic continuation also
+requires that the parent still uses the built-in Agent. A subagent has no
+`ask_user` and cannot start subagents; exploration conversations cannot start
+them either. A subagent dispatched from a WeChat-originated turn keeps that turn's approval floor for
+mutating tools. The parent link is stored on the conversation
+(`frames.dispatched_from`) and survives restart; a turn that was running at
+shutdown is not resumed.
+
+Subagents share their mechanism with the research assistant's
+`dispatch_to_project`: both implement `Dispatcher` in
+`src-tauri/src/dispatch.rs`, which owns the startup acknowledgement, turn
+observation and result delivery.
+
+Manual smoke steps (run only with user permission): select `ssh:CPU3` in a
+parent conversation and dispatch a child that uses that context explicitly.
+Verify the child inherits the selection. Have it return a missing-information
+request and verify the parent answers and sends the follow-up without a human
+message in the child. Remove or change the parent's context and verify the
+next follow-up picks up the change. Cancel a child or start a newer child turn
+while an earlier result is being reviewed; the older report must not restart
+the task. These steps require an already configured host; automated regressions
+use a temporary store and a fake tool, with no SSH connection or real model.
+
+## Agent-opened branches
+
+A conversation's Agent can also open a **branch** of its own conversation with
+the `open_branch` tool: the same kind of conversation branch `/fork` or
+**Branch** on a message creates, nested under the conversation in the sidebar,
+with **Merge back**, move and delete working as for any branch. The agent gives
+it a title and a brief. The branch is created when the turn that asked for it
+ends, from the conversation's history up to and including that turn's reply, so
+it already knows everything the parent knew when it was opened. The parent
+conversation gets a reply saying the branch was opened and quoting the brief,
+and opening the branch shows the brief in its composer as an unsent draft for
+the researcher to edit and send.
+
+The tool and `dispatch_subagent` solve different problems, and the difference
+is who continues the new conversation:
+
+| | `open_branch` | `dispatch_subagent` |
+| --- | --- | --- |
+| Starts with | the parent's history through this turn | nothing but the instruction |
+| Driven by | the researcher and the branch's own agent | the parent's agent (follow-ups, status, stop) |
+| Researcher can write | yes, as in any branch | no, watch-only |
+| Reports back | never; nothing wakes the parent | automatically, and the parent continues |
+| Permissions | the researcher's, copied like `/fork` | reviewed against the parent turn's captured request |
+
+Use `open_branch` for a line of work the researcher should own: an alternative
+approach, a tangent worth its own conversation, a long follow-up that needs
+this context to start from. Use `dispatch_subagent` when the agent must run the
+work itself and act on the result. The tool returns as soon as the request is
+recorded and tells the model not to wait or poll; the branch appears after the
+turn. A turn may ask for at most three branches.
+
+`open_branch` is offered only in ordinary conversations: not in branches
+(branches cannot be branched again), not in explorations or subagent
+conversations, not in the research assistant, and ACP conversations have no
+built-in tools. Asking from a conversation whose exploration round is frozen
+fails like `/fork` does. A cancelled or cut-off turn drops the request, since
+its checkpoint would not be a finished turn. If the branch cannot be created
+after the turn, the status line says so and the parent is unchanged.
+
+Limitations for now: the branch always starts with the full prefix
+(`context: "prefix"`; a hand-over summary or a fresh start are not offered),
+and the researcher sends the brief (`autostart: false`; the branch's agent
+does not start on its own). The composer draft is held in the window, like
+other unsent text, so it does not survive a restart; the brief quoted in the
+parent's notice does.
+
+Manual smoke steps (run only with user permission): in an ordinary
+conversation, ask the agent to "open a branch to try the other normalization
+and leave me a brief". After the turn ends, the sidebar shows the new branch
+under the conversation and the conversation ends with a reply naming it.
+Open the branch: the composer holds the brief, the history matches the parent
+through that turn, and sending the brief starts the branch's own agent. The
+parent does not react to anything done in the branch. **Merge back** on the
+branch works as for a `/fork` branch. Ask for a branch from inside a branch or
+an exploration: the agent has no such tool there.
+
+## Persistence and safety
+
+- Wisp persists the resolved v2 plan before execution. Stored steps contain the
+  immutable Specialist, requested model/executor preferences, capability
+  revisions, resolved permissions/model/executor, contracts, budgets, and
+  policy integrity hash used for revalidation. ACP tasks do not store a
+  decorative Native model that the ACP process would ignore.
+- Background executions persist a generation and completion intent before
+  launch. Result insertion, conversation delivery, auto-resume claim, and
+  resume outcome are separate durable states; application restart never
+  guesses that an unknown external process is still running.
+- Before approval, a v2 draft exposes both its editable proposal and the
+  resolved authority that will actually run. Each edit checks the draft's
+  version, reruns dependency and policy resolution, and replaces the plan
+  atomically. Approval makes the snapshot immutable; run and retry reuse that
+  exact snapshot instead of asking a planner to recreate it.
+- Read-only tasks may share the project workspace. Writable or executable
+  tasks without isolation use one mutation lane and cannot edit the same
+  checkout concurrently. When Git is installed and the project checkout is
+  clean, a task may instead use a unique temporary Git worktree and run in
+  parallel with other isolated writers. The approval card shows that Wisp will
+  conflict-check and then cherry-pick the task's temporary commit.
+- Native and ACP children both receive the isolated project root. Wisp captures
+  a changed-file manifest and binary-capable patch, serializes merge decisions,
+  and removes the temporary worktree and branch on success, failure, or
+  cancellation. A failed child is never merged. A rejected/conflicting merge
+  leaves the main checkout unchanged and stores the patch as an Artifact.
+  Child-declared artifacts are copied to durable app storage before worktree
+  cleanup, so their paths do not expire with the temporary directory. If a
+  declared local artifact cannot be retained, the task fails and its project
+  patch is not merged.
+- Native Python/R kernels use a request-scoped runtime namespace instead of a
+  project-wide kernel while isolated. Worktree finalization waits for Runs
+  owned by that child; a failed/cancelled child cancels them. Timeout/drop
+  cleanup cancels remaining child Runs and stops its runtime before removing
+  the worktree.
+- Non-Git and dirty project checkouts do not advertise isolation. Ordinary
+  writable tasks still work there through the serialized mutation lane; an
+  explicit isolation request fails closed instead of silently weakening its
+  workspace guarantee. Initial isolation intentionally does not copy ignored
+  files or add overlayfs/APFS/ZFS/ProjFS backends.
+- Children receive only their instruction, bounded shared context, applicable
+  project instructions, explicit inputs, and direct dependency results. They
+  do not receive the full parent transcript.
+- Workflow nodes use their saved instructions and contracts. Conversion source
+  documents and hashes are provenance; changing or removing a source Skill
+  does not change an independent Workflow or invalidate its resource grant.
+  Nonempty legacy `skill_ids`/resolved Skill bindings cannot execute.
+- Delegated Agents receive `delegate_tasks` only from an approved `delegation`
+  capability and only while root-wide depth, task, concurrency, token, tool,
+  cost, cancellation, and time checks still have capacity.
+- Output contracts are checked before results reach the parent. Attempts,
+  structured results, artifacts, evidence, usage, child conversation IDs, and
+  backend session IDs remain auditable in SQLite. Secrets stay in the existing
+  credential stores.
+
+## Convert Skills into independent Workflows
+
+In Workflow Studio, **New workflow → From Skills** opens a conversion workspace with three
+stages: choose sources, convert to nodes, and review the draft. Enter the research
+question, available inputs and expected deliverables on the left. Choose up to
+eight installed source Skills using the searchable checklist, or let the model
+select up to three relevant methods. The full-width conversion model selector
+is separate from the execution models configured later for individual nodes.
+The converter reads the complete selected
+method documents and Markdown references, then produces independent node
+instructions, dependency edges, capability requests and output contracts.
+The review pane shows the actual proposal: each node's saved instructions,
+dependencies, requested capabilities and expandable output schema. Missing
+structured output contracts are stated explicitly. Source methods appear once
+as conversion provenance, with the selection rationale and source fingerprint
+available for inspection. No runtime node calls
+`use_skill`, and `side_effects` is not used to infer permissions.
+
+**Use draft and edit** transfers the proposal into the graph editor without
+saving or executing it. The proposed goal supplies the initial template name;
+legacy conversions retain the original template name. Review and save the
+template in Studio before using the normal execution/approval flow.
+
+During conversion, the review pane reports the host's current stage: preparing,
+matching source methods (automatic selection only), reading documents, generating
+nodes, checking the proposal, correcting rejected nodes if needed, and saving
+source provenance. The activity indicator is indeterminate; elapsed time is shown
+without guessing a completion percentage or deadline.
+
+**Continue in background**, the close button, backdrop click and Escape all hide
+the conversion dialog while work continues. You can leave Settings or switch
+projects. A persistent status card shows progress, completion or failure; **View
+progress / View result** returns to the originating project and reopens the same
+request and draft. Completion does not overwrite the graph editor or save a
+template automatically. Inputs stay disabled during conversion. A window handles
+one conversion at a time; the draft remains available until used or its inputs
+are edited. This state lasts for the current app window, not across window
+closure, reload or app restart.
+
+Changing conversion inputs invalidates the previous draft. Conversion failures
+appear inside the conversion window and can be retried with the original inputs.
+Escape closes this window before any graph connection operation or the parent
+Studio. Missing source Skills or configured
+models show setup guidance and disable generation. The layout stacks vertically
+in narrow windows, scrolls to the generated draft, and keeps footer actions visible.
+
+The host validates the resulting graph against the current resource policy.
+An unavailable source, unsupported package resource, invented capability or
+invalid graph fails explicitly. Generated drafts use **Review every draft**;
+conversion neither runs a node nor grants execution permission. Review the
+instructions, tools, execution context and output schema before saving or
+creating a run. Node budgets remain unset unless explicitly configured.
+
+The main Agent's `create_workflow` tool uses this same shared converter. It
+accepts `skill_name`, optional `workflow_name`/`description`, and an optional
+`planner_model_id`. Legacy single-node `params` overrides are retired; edit the
+result in Studio instead. `explain_workflow` inspects a saved graph without
+running it. Execution still uses the normal reviewed Workflow/`delegate_tasks`
+path. Main Agents can continue to use Skills directly in ordinary conversations.
+
+The source reader currently supports method documents and external CLI
+requirements. Packages with executable scripts, runtime sidecars, assets or non-Markdown references report a
+resource-snapshot limitation instead of silently creating a dependent wrapper.
+No additional Skill frontmatter, Workflow YAML or script-entrypoint grammar is
+required. Runtime tool support still depends on the host: CLI children currently
+use local Runs, while desktop nodes use their resolved Native/ACP resource grants.
+
+### Existing templates and historical runs
+
+Legacy Skill-bound templates remain visible with a conversion warning. Their
+Skill picker is removed and saving/running is blocked until **Convert to
+independent Workflow** generates a draft for review. Saving the replacement
+preserves the prior template under a separate legacy record. Missing source
+Skills must be reinstalled before conversion. Historical runs remain inspectable;
+their conversion action creates a new definition rather than rewriting past
+results. Legacy runs cannot be approved, restarted or resumed with their old
+Skill bindings. Built-in templates now contain their own method instructions.
+
+### Node approvals and verified results
+
+Native child confirmations and flagged, already-authorized ACP operations use
+the existing confirmation card in the owning conversation. The card identifies
+the node and offers a one-time decision; it does not inherit the parent's full
+permission or create a persistent grant. Requests sharing an owner queue so
+parallel nodes cannot replace one another's pending question. Cancellation
+cleans up its request without dismissing a newer card.
+
+Converted output contracts require a successful status, summary and artifact
+paths. Native and ACP hosts validate these contracts and capture declared files
+as durable ArtifactVersions before reporting success. Failed tool calls cannot
+be hidden by a Native success summary. Missing files, escaped paths or invalid
+contracts fail the node and block its dependents. Before reusing a successful
+converted node on retry, the host checks its output contract and pinned artifact
+checksums. Changed outputs require a new run. A textual success claim alone is
+insufficient; these strict contracts are exempt from degraded-success delivery.
+
+The built-in Data-driven research design retains its eight-part synthesis and
+records upstream task evidence sources. It no longer binds mutable Skill packages.
+
+- The main conversation and its MCP bridge always list the delegation tools;
+  only the research assistant and subagent conversations go without them.
+  Workflow history is never erased, and cancelling a workflow is always
+  explicit.
+
+## Dynamic Agents panel
+
+The right-panel Agents view shows workflow activity owned by the active
+conversation. Switching conversations switches the panel context; work in
+other conversations keeps running in the background. Workflow definitions are
+created and edited only in **Settings → Workflows**; the panel links directly
+to that standalone Studio and does not embed a second editor.
+Nested workflows appear indented beneath the root workflow with their depth
+and namespaced task IDs. They are execution records rather than independent
+drafts, so lifecycle controls remain on the root only.
+Each dynamic task shows dependencies, requested capabilities, optional
+Specialist, resolved model and executor, workspace/tool authority, approval
+reasons, status, duration, usage, summary, and whether a full result is
+available. **Inspect result** opens a readable view of the persisted summary,
+deliverables, changes, evidence, checks, risks, and custom output fields. Child
+conversation IDs and other execution-envelope details stay internal; the panel
+does not offer a separate child-conversation takeover flow.
+
+Workflow Studio creates arbitrary task graphs instead of assembling a fixed
+team. Add bounded tasks, connect them with dependencies, and choose
+capabilities, Specialist persona, model, eligible executor, isolation,
+budgets, and output schemas there.
+
+### Editing a research workflow
+
+Workflow Studio centers and fits the existing tasks when a template opens or the
+structure changes. While fit mode is active, resizing the window refits the graph.
+Selecting nodes, folding configuration, and opening the node editor preserve the
+canvas dimensions. The zoom buttons switch to manual zoom; click the percentage
+(**Fit workflow to viewport**) to return to automatic fitting. Editing instructions preserves
+manual zoom and input focus.
+
+Task cards show the instruction, Agent assignment, capabilities, dependencies, and
+**Not run** template status. Stage backgrounds group tasks by dependency depth;
+the summary reports task count, stage count and the widest stage. This is the
+parallel task count within a stage, not a prediction of peak live concurrency. Selecting a task highlights its incoming and
+outgoing edges; hovering an edge highlights its endpoints. The minimap appears for
+more than eight tasks or zoom below 70%.
+
+Use **Add task → Independent task** for a new root, or **After selected task** for
+a dependent task. Escape closes the add menu first, then cancels an active connection,
+then clears the selected-node summary, then leaves the studio. A node-editing or
+new-workflow dialog closes before these underlying surfaces. Capability choices
+are collapsed initially, with up to three
+selected capability names and an additional count visible. Expand the section to
+edit them. Dependency choices and advanced settings expand separately. Workflow-wide
+settings remain in the right-hand **Workflow configuration** column.
+
+Manual layout smoke check: open Literature evidence review at 1280×800 and
+1920×1080, confirm all three task cards are centered and readable, resize the
+window, then zoom manually and edit an instruction. Expand capabilities,
+toggle a choice, and confirm the section stays open. Open Add task and immediately
+press Escape: the editor must remain open. Add an independent task and a task after
+it, then save a copy and verify the dependency survives reopening. Test New workflow
+with all three creation options and cancel. Single-click a node for its summary,
+double-click it to edit, and verify Escape closes only the modal. Fold and unfold
+configuration without changing the canvas dimensions. At 1280×800, 1920×1080 and 3840×2160,
+confirm the zoom percentage and classic scrollbar visibility settle instead of
+oscillating. Manual zoom must still allow scrolling; Fit resets the scroll position. Check both light
+and dark themes. These layout changes apply to the template editor; live execution
+status remains in the Agents activity panel.
+
+Only schema-version-2 dynamic plans are part of the product surface. Earlier
+fixed-plan records are not migrated or deleted, but the Agents panel does not
+list them and workflow actions reject them before approval, retry, or execution.
+
+## Manual smoke check
+
+Ask the main Agent to compare two project files using two independent
+temporary Agents. Confirm in the Agents panel that the two root
+tasks overlap, their dependent synthesis task waits, and the final chat
+response contains one synthesized comparison. Repeat the request and ask for
+it to run in the background. Verify the `delegate_tasks` call sets
+`background`, and its initial tool result is a running handle. The same
+conversation should later show exactly one completion card, followed by one
+synthesized assistant update once the conversation is idle. Start another
+parent turn and verify a completion waits behind it. Then create an equivalent graph in
+**Settings → Workflows**, attach it from the composer, and confirm the Agents
+panel shows the run without showing workflow editing fields. Repeat with a
+write capability: Wisp should show the exact resolved authority and start zero
+children if approval is denied.
+Open a completed task result and confirm its sections and rendered Markdown are
+readable without raw JSON or a child-conversation action. Press Escape
+immediately after opening it and confirm only the result dialog closes.
+Finally, add the **Nested delegation** capability to one root task and let it
+create two independent leaf tasks. Confirm that both leaves appear under the
+same root card at depth 2, their IDs are prefixed by the parent task, their
+structured results appear in the root result, and cancelling the root marks
+the parent and both leaves for cancellation.
+For the isolation path, start from a clean Git project and create two independent
+write tasks with **Use an isolated workspace** enabled. Confirm that approval
+shows **Conflict-check, then cherry-pick**, both children overlap, both changes
+land as separate commits, and no `wisp-agent/*` worktree branch remains. Then
+make both tasks edit the same line and confirm one merge is rejected, the main
+file keeps the accepted change, and the rejected patch is available as an
+Artifact. Cancel another isolated writer and confirm its partial patch is
+preserved without modifying the main checkout.

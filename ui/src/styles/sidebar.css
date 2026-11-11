@@ -1,0 +1,547 @@
+/* ---------- Left sidebar ---------- */
+.sidebar {
+  position: relative;
+  flex: 0 0 var(--sidebar-width, 248px); width: var(--sidebar-width, 248px);
+  background: var(--bg-sunken);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  /* No top padding: .sidebar-head is var(--toolbar-h) tall, matching the
+     chat topbar and right-pane tabs. */
+  padding: 0 10px 12px;
+  gap: 6px;
+  overflow: hidden;
+  transition:
+    flex-basis var(--motion-duration-medium) var(--motion-ease-decelerate),
+    width var(--motion-duration-medium) var(--motion-ease-decelerate),
+    padding var(--motion-duration-medium) var(--motion-ease-decelerate);
+}
+.sidebar.collapsed { flex-basis: 0; width: 0; padding: 12px 0; border-right: none; }
+.sidebar-resizer {
+  position: relative;
+  z-index: 2;
+  flex: 0 0 10px;
+  width: 10px;
+  margin-left: -5px;
+  margin-right: -5px;
+  cursor: col-resize;
+}
+.sidebar-resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--border);
+  transition: background .12s ease;
+}
+.sidebar-resizer:hover::after { background: var(--clay); }
+
+
+.nav { display: flex; flex-direction: column; gap: 2px; }
+/* The nav never shrinks or scrolls: flex-shrink is weighted by content size,
+   so a long session list used to squeeze it into a tiny scroller. Short
+   windows fold its tail into the "More" flyout (tiers below) instead. */
+.sidebar > .nav { flex-shrink: 0; }
+.sidebar > .side-foot { flex-shrink: 0; }
+.side-btn {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; text-align: left;
+  background: transparent; color: var(--text-muted);
+  border: 1px solid transparent; border-radius: var(--radius-sm);
+  padding: 8px 10px; font: inherit; font-size: calc(13.5px * var(--ui-font-scale, 1)); cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+.side-btn:hover { background: var(--bg-elev); color: var(--text); }
+.side-btn.primary { color: var(--text); }
+.side-btn.primary:hover { background: var(--clay-soft); }
+.side-btn-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Nav icons share one Lucide-style SVG set (compose_icon); keep them optically
+   aligned with the 13.5px label and dimmed until hover, like the old glyphs. */
+.side-btn > svg { width: 16px; height: 16px; flex: 0 0 auto; opacity: .8; }
+.side-btn:hover > svg,
+.side-btn.primary > svg { opacity: 1; }
+.side-shortcut {
+  flex: 0 0 auto; margin-left: auto; border: 0; background: transparent;
+  color: var(--text-faint); font: calc(11px * var(--ui-font-scale, 1))/1 var(--font-ui); opacity: .78;
+}
+.side-btn:hover .side-shortcut { color: var(--text-muted); opacity: 1; }
+
+/* "More" flyout (Kimi-style), opening to the right of the button. Entries
+   carry a tier: below that window height they leave the inline nav and show
+   in the flyout instead. Tall windows show everything inline and no More.
+   ponytail: px tiers ignore --ui-font-size; measure the nav with a
+   ResizeObserver if very large UI fonts still crowd the session list. */
+.nav-more, .nav-more-menu .side-btn { display: none; }
+.nav-more.open { background: var(--bg-elev); color: var(--text); }
+.nav-more-caret { display: inline-flex; margin-left: auto; opacity: .35; transition: opacity .12s ease; }
+.nav-more:hover .nav-more-caret,
+.nav-more.open .nav-more-caret { opacity: .7; }
+.nav-more-caret svg { width: 14px; height: 14px; }
+.nav-more-backdrop { position: fixed; inset: 0; z-index: 80; }
+.nav-more-menu {
+  position: fixed; z-index: 81; min-width: 184px; padding: 6px;
+  display: flex; flex-direction: column; gap: 2px;
+  background: var(--bg-elev); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); box-shadow: 0 8px 28px rgba(0,0,0,.14);
+  transform-origin: top left;
+  animation: motion-surface-in-soft var(--motion-duration-fast) var(--motion-ease-decelerate) both;
+}
+.nav-more-menu .side-btn:hover { background: var(--bg-sunken); }
+.nav-more-menu .side-btn.active { background: var(--clay-soft); color: var(--clay-strong); }
+@media (max-height: 820px) {
+  .nav > .nav-tier-1 { display: none; }
+  .nav-more, .nav-more-menu .nav-tier-1 { display: flex; }
+  /* A folded entry that is open (e.g. Publication) lights up More instead. */
+  .nav:has(> .nav-tier-1.active) > .nav-more { background: var(--clay-soft); }
+  .nav:has(> .nav-tier-1.active) > .nav-more,
+  .nav:has(> .nav-tier-1.active) > .nav-more > svg { color: var(--clay-strong); }
+}
+@media (max-height: 640px) {
+  .nav > .nav-tier-2 { display: none; }
+  .nav-more-menu .nav-tier-2 { display: flex; }
+}
+
+.side-list { display: flex; flex-direction: column; gap: 1px; overflow-y: auto; flex: 1 1 auto; scrollbar-gutter: stable; overscroll-behavior: contain; }
+
+/* --- Session sort/group control --- */
+.side-sessions-head { position: relative; display: flex; align-items: center; justify-content: space-between; padding: 10px 10px 4px; }
+.side-sessions-title { font-size: calc(11px * var(--ui-font-scale, 1)); font-weight: 600; letter-spacing: .02em; color: var(--text-faint); }
+.side-sessions-head-actions { display: flex; align-items: center; gap: 3px; }
+.side-select-btn {
+  border: 0; border-radius: var(--radius-xs); padding: 4px 6px;
+  background: transparent; color: var(--text-faint); font: inherit; font-size: calc(11px * var(--ui-font-scale, 1)); cursor: pointer;
+}
+.side-select-btn:hover, .side-select-btn[aria-pressed="true"] { background: var(--bg-elev); color: var(--text); }
+.side-select-btn:disabled { cursor: default; opacity: .45; }
+.side-sort-btn { width: 26px; height: 26px; color: var(--text-faint); }
+.side-sort-btn svg { width: 16px; height: 16px; }
+.side-sort-btn:hover, .side-sort-btn.active { color: var(--text); background: var(--bg-elev); }
+.side-sort-backdrop { position: fixed; inset: 0; z-index: 40; }
+.side-sort-menu {
+  position: absolute; z-index: 41; top: 34px; right: 8px; min-width: 184px;
+  background: var(--bg-elev); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); box-shadow: 0 8px 28px rgba(0,0,0,.14); padding: 8px;
+  transform-origin: top right;
+  animation: motion-surface-in-soft var(--motion-duration-fast) var(--motion-ease-decelerate) both;
+}
+.side-sort-label { font-size: calc(10.5px * var(--ui-font-scale, 1)); color: var(--text-faint); padding: 2px 6px 5px; }
+.side-sort-opts { display: flex; flex-direction: column; gap: 1px; }
+.side-sort-opt {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%;
+  background: transparent; border: none; border-radius: var(--radius-xs); padding: 6px 8px;
+  font: inherit; font-size: calc(13px * var(--ui-font-scale, 1)); color: var(--text); cursor: pointer; text-align: left;
+}
+.side-sort-opt:hover { background: var(--bg-sunken); }
+.side-sort-opt.active { color: var(--clay); }
+.side-sort-check { display: inline-flex; opacity: 0; color: var(--clay); }
+.side-sort-check.on { opacity: 1; }
+.side-sort-check svg { width: 15px; height: 15px; }
+.side-sort-sep { height: 1px; background: var(--border); margin: 7px 4px; }
+/* Selecting turns the head into the bulk toolbar: tick-all + count on the left, actions on the right. */
+.side-bulk-all {
+  display: inline-flex; align-items: center; gap: 9px; min-width: 0; padding: 4px 6px 4px 2px;
+  border: 0; border-radius: var(--radius-xs); background: transparent;
+  color: var(--text-muted); font: inherit; font-size: calc(12px * var(--ui-font-scale, 1)); white-space: nowrap; cursor: pointer;
+}
+.side-bulk-all:hover { color: var(--text); }
+.side-bulk-all.has-selection { color: var(--text); font-weight: 600; }
+.side-bulk-all .session-select-mark { display: inline-flex; }
+.side-sessions-head-actions .icon-btn:disabled { cursor: default; opacity: .4; background: transparent; color: var(--text-faint); }
+/* Done is the one way out of selecting, so it reads as the head's action. */
+.side-select-btn.side-select-done { color: var(--clay-strong); font-weight: 600; }
+/* The bulk bar sits under the list: a hint until something is ticked, then
+   labelled Move / Delete, so no disabled ghost icons ever show. */
+.side-bulk-bar {
+  position: relative; flex-shrink: 0;
+  display: flex; align-items: center; gap: 6px; min-height: 40px;
+  padding-top: 6px; border-top: 1px solid var(--border);
+  animation: motion-surface-in-soft var(--motion-duration-fast) var(--motion-ease-decelerate) both;
+}
+.side-bulk-hint {
+  flex: 1 1 auto; min-width: 0; padding: 0 6px; text-align: center;
+  color: var(--text-faint); font-size: calc(11.5px * var(--ui-font-scale, 1));
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.side-bulk-action {
+  flex: 1 1 0; min-width: 0; height: 32px; padding: 0 10px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  background: var(--bg-elev); color: var(--text);
+  font: inherit; font-size: calc(12.5px * var(--ui-font-scale, 1)); white-space: nowrap; cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+.side-bulk-action span { overflow: hidden; text-overflow: ellipsis; }
+.side-bulk-action svg { width: 15px; height: 15px; flex: 0 0 auto; }
+.side-bulk-action:hover, .side-bulk-action.active { border-color: var(--text-faint); }
+.side-bulk-action.danger { color: var(--err); }
+.side-bulk-action.danger:hover {
+  background: color-mix(in srgb, var(--err) 8%, var(--bg-elev));
+  border-color: color-mix(in srgb, var(--err) 45%, transparent);
+}
+/* Opened from the bar, the move menu rises above it instead of dropping from the head. */
+.side-bulk-move-menu { top: auto; bottom: calc(100% + 6px); left: 0; right: 0; min-width: 0; transform-origin: bottom center; }
+.side-bulk-move-menu .side-sort-opts { max-height: min(50vh, 320px); overflow-y: auto; }
+.side-bulk-move-menu .side-sort-opt span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.side-item {
+  display: flex; align-items: center; gap: 9px;
+  padding: 7px 10px; border-radius: var(--radius-sm);
+  font-size: calc(13px * var(--ui-font-scale, 1)); color: var(--text-muted); white-space: nowrap;
+}
+.side-session-filters { display: flex; flex-wrap: wrap; gap: 5px; padding: 0 6px 6px; }
+.side-session-filters button {
+  display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); background: transparent;
+  color: var(--text-muted); font: inherit; font-size: calc(11px * var(--ui-font-scale, 1)); cursor: pointer;
+}
+.side-session-filters button[aria-pressed="true"] { color: var(--clay-strong); border-color: var(--clay); background: var(--clay-soft); }
+.side-session-filters button:hover { background: var(--bg-elev); }
+.side-session-filters svg { width: 13px; height: 13px; flex: 0 0 auto; }
+.ses-status-label {
+  flex: 0 0 auto; margin-left: auto; padding: 1px 5px; border-radius: var(--radius-xs);
+  font-size: calc(10px * var(--ui-font-scale, 1)); font-weight: 600; white-space: nowrap;
+}
+.ses-status-label.needs-you { color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.ses-status-label.running { color: var(--clay); background: var(--clay-soft); }
+.side-attention-icon { display: inline-flex; flex: 0 0 auto; color: var(--warn); }
+.side-attention-icon svg { width: 16px; height: 16px; }
+.side-item:hover { background: var(--bg-elev); color: var(--text); }
+button.side-item { width: 100%; text-align: left; background: transparent; border: 1px solid transparent; font: inherit; font-size: calc(13px * var(--ui-font-scale, 1)); cursor: pointer; }
+button.side-item.ses { cursor: pointer; user-select: none; padding-right: 34px; }
+button.side-item.ses.selecting { padding-right: 10px; }
+/* Tick boxes keep a 3:1 edge against the sunken sidebar (the old hairline
+   border-strong was ~1.3:1 and made every row look disabled). */
+.session-select-mark {
+  display: none; align-items: center; justify-content: center; width: 16px; height: 16px; flex: 0 0 auto;
+  border: 1.5px solid color-mix(in srgb, var(--text-faint) 90%, transparent); border-radius: 4px; color: transparent;
+  transition: background .12s ease, border-color .12s ease;
+}
+.session-select-mark svg { width: 12px; height: 12px; }
+.side-item.ses.selecting .session-select-mark { display: inline-flex; }
+.side-item.ses.selecting .ses-status { display: none; }
+.side-item.ses.selecting:hover .session-select-mark,
+.side-folder.selecting:hover .session-select-mark,
+.side-bulk-all:hover .session-select-mark { border-color: var(--text-muted); }
+/* While selecting only the tick state is highlighted; the open conversation's
+   grey fill would read as a second kind of selection. */
+.side-item.ses.selecting.active:not(:hover) { background: transparent; }
+/* Ticked rows get a flat tint, no outline, so a run of them reads as one block. */
+.side-item.ses.selected,
+.side-item.ses.selecting.active.selected { background: var(--clay-soft); border-color: transparent; color: var(--text); }
+.side-item.ses.selected:hover { background: color-mix(in srgb, var(--clay) 18%, transparent); }
+.side-item.ses.selected .session-select-mark,
+.session-select-mark.on { background: var(--clay); border-color: var(--clay); color: var(--on-clay); }
+button.session-select-mark { padding: 0; background: transparent; cursor: pointer; }
+button.session-select-mark:disabled { cursor: default; opacity: .4; }
+.side-folder.selecting .session-select-mark { display: inline-flex; }
+.side-folder.selecting .folder-actions { display: none; }
+.side-folder.selecting.selected { background: var(--clay-soft); color: var(--text); }
+.side-folder-count.partial { color: var(--clay-strong); font-weight: 600; }
+/* A nested row's kind icon rests in the status slot and yields to live status. */
+.session-branch-icon { display: inline-flex; color: var(--clay); }
+.ses-status .session-branch-icon svg { width: 15px; height: 15px; }
+.side-item.ses.running .session-branch-icon,
+.side-item.ses.attention .session-branch-icon { display: none; }
+/* Left status slot holds geometry at rest. Running is a comet ring,
+   attention a circle-alert — never a raw color dot. */
+.ses-status {
+  position: relative;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; flex: 0 0 auto;
+}
+.ses-status svg { width: 16px; height: 16px; }
+.ses-live, .ses-attention {
+  display: none; align-items: center; justify-content: center;
+  position: absolute; inset: 0;
+}
+.side-item.ses.running:not(.attention) .ses-live { display: inline-flex; }
+.side-item.ses.attention .ses-attention { display: inline-flex; }
+.ses-live { color: var(--agent-running); filter: drop-shadow(0 0 5px color-mix(in srgb, var(--agent-running) 50%, transparent)); }
+.ses-live svg { animation: ses-spin var(--agent-orbit-duration) linear infinite; }
+.ses-attention { color: var(--agent-waiting); filter: drop-shadow(0 0 4px color-mix(in srgb, var(--agent-waiting) 45%, transparent)); }
+.ses-attention svg { animation: ses-breathe var(--agent-pulse-duration) var(--agent-motion-ease) infinite; }
+.side-item-wrap { position: relative; min-width: 0; }
+/* Row menus are revealed only on hover/keyboard focus — including the active
+   session — so the list reads as plain titles at rest. Opacity (not display)
+   keeps the button tabbable; :focus-within lights it up on keyboard focus. */
+.session-actions, .folder-actions {
+  position: absolute; z-index: 1; top: 50%; right: 5px; transform: translateY(-50%);
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 25px; height: 25px; padding: 0;
+  border: 1px solid transparent; border-radius: var(--radius-xs);
+  background: color-mix(in srgb, var(--bg-elev) 92%, transparent);
+  color: var(--text-faint); font: inherit; line-height: 1;
+  cursor: pointer; opacity: 0;
+  transition: opacity .12s ease, color .12s ease, background .12s ease;
+}
+.side-item-wrap:hover .session-actions,
+.side-item-wrap:focus-within .session-actions,
+.side-folder:hover .folder-actions,
+.side-folder:focus-within .folder-actions { opacity: 1; }
+.session-actions:hover, .session-actions:focus-visible,
+.folder-actions:hover, .folder-actions:focus-visible { color: var(--text); background: var(--bg-input); }
+.session-actions svg, .folder-actions svg { width: 14px; height: 14px; }
+.session-actions.selection-hidden { display: none; }
+/* A flat fill, not a raised white card, so the current item belongs to the
+   sunken sidebar surface instead of floating above it. */
+.side-item.active { background: color-mix(in srgb, var(--text) 7%, transparent); color: var(--text); box-shadow: none; }
+@keyframes ses-spin { to { transform: rotate(360deg); } }
+@keyframes ses-breathe {
+  0%, 100% { transform: scale(.92); opacity: .82; }
+  50% { transform: scale(1); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ses-live svg, .ses-attention svg { animation: none; }
+}
+.ses-initial { display: none; }
+.ses-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+/* Explorations, branches (#531) and subagents (#1061) hang under the session that
+   started them: one chevron on the parent, one guide line dropping from it. */
+.side-nest-group { display: flex; flex-direction: column; gap: 1px; }
+.side-nest-toggle {
+  position: absolute; z-index: 1; top: 50%; left: 11px; transform: translateY(-50%);
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; padding: 0; border: 0; border-radius: var(--radius-xs);
+  background: transparent; color: var(--text-faint); cursor: pointer;
+  transition: opacity .12s ease, color .12s ease;
+}
+.side-nest-toggle svg { width: 13px; height: 13px; transition: transform .15s ease; }
+.side-nest-toggle.collapsed svg { transform: rotate(-90deg); }
+/* The slot shows live status first; the chevron takes it back on hover or keyboard focus. */
+.side-item.ses.running ~ .side-nest-toggle,
+.side-item.ses.attention ~ .side-nest-toggle { opacity: 0; }
+.side-item-wrap:hover > .side-nest-toggle,
+.side-nest-toggle:focus-visible { opacity: 1; background: var(--bg-elev); }
+.side-nest-toggle:hover, .side-nest-toggle:focus-visible { color: var(--text); }
+.side-item.ses.selecting ~ .side-nest-toggle,
+.side-item.ses.selecting ~ .side-nest-count { display: none; }
+/* Collapsed parents say how much they hide, in the gutter the row menu uses on hover. */
+.side-nest-count {
+  position: absolute; top: 50%; right: 12px; transform: translateY(-50%);
+  display: none; color: var(--text-faint); pointer-events: none;
+  font-size: calc(11px * var(--ui-font-scale, 1)); font-variant-numeric: tabular-nums;
+}
+.side-nest-group.collapsed .side-nest-count { display: block; }
+.side-item-wrap:hover > .side-nest-count,
+.side-item-wrap:focus-within > .side-nest-count { opacity: 0; }
+.side-nest {
+  display: flex; flex-direction: column; gap: 1px;
+  margin-left: 19px; padding-left: 6px; border-left: 1px solid var(--border);
+}
+.side-nest-group.collapsed > .side-nest { display: none; }
+.side-folder-sessions .side-nest-toggle { left: 19px; }
+.side-folder-sessions .side-nest { margin-left: 27px; }
+.side-nest-items { display: flex; flex-direction: column; gap: 1px; }
+/* Nested rows start their icon where the parent's title starts, and mark the
+   open one with a flat tint so the guide line stays readable beside it. */
+.side-nest .side-item-wrap > .side-item { padding-left: 9px; }
+.side-nest .side-item.active { background: var(--clay-soft); box-shadow: none; }
+.side-nest .side-item.active ~ .session-actions:not(:hover):not(:focus-visible) { background: transparent; }
+.side-exploration {
+  display: flex; min-width: 0; width: 100%; align-items: center; gap: 9px;
+  padding: 6px 9px; border: 1px solid transparent; border-radius: var(--radius-sm);
+  background: transparent; color: var(--text-muted); font: inherit; text-align: left; cursor: pointer;
+}
+.side-exploration:hover { background: var(--bg-elev); color: var(--text); }
+.side-exploration.active { background: var(--clay-soft); color: var(--text); }
+.exploration-kind-icon { display: inline-flex; flex: 0 0 auto; color: var(--clay); }
+.exploration-kind-icon svg { width: 14px; height: 14px; }
+.side-exploration .exploration-kind-icon { width: 16px; justify-content: center; }
+.side-exploration .exploration-kind-icon svg { width: 15px; height: 15px; }
+.side-exploration-copy { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+.side-exploration-title { overflow: hidden; font-size: calc(13px * var(--ui-font-scale, 1)); text-overflow: ellipsis; white-space: nowrap; }
+.side-exploration-meta { overflow: hidden; color: var(--text-faint); font-size: calc(9.5px * var(--ui-font-scale, 1)); text-overflow: ellipsis; white-space: nowrap; }
+.side-hint { font-size: calc(12px * var(--ui-font-scale, 1)); color: var(--text-faint); padding: 6px 10px; }
+.side-load-more { width: 100%; margin-top: 6px; padding: 7px; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text-muted); font-size: calc(12px * var(--ui-font-scale, 1)); cursor: pointer; }
+.side-load-more:hover { background: var(--surface-hover); color: var(--text); }
+.side-load-more:disabled { cursor: default; opacity: .6; }
+
+.side-foot { margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border); }
+/* Capabilities / Feedback / Settings sit in one row of icons under the
+   skills line; the tooltip and accessible name carry the label. Icons line up
+   with the 12px inset of the meta text above. */
+.side-foot-actions { display: flex; align-items: center; gap: 2px; padding: 0 4px; }
+.side-foot-actions .side-btn { flex: 0 0 auto; width: 34px; height: 34px; padding: 0; gap: 0; justify-content: center; }
+.side-foot-actions .side-btn > svg { width: 17px; height: 17px; }
+.side-foot-actions .side-btn-label {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap;
+}
+
+/* Update-available prompt card (footer). Mirrors the "Relaunch to update" chip. */
+.update-card {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; text-align: left; margin: 0 0 6px;
+  padding: 8px 10px; font: inherit; cursor: pointer;
+  background: var(--clay-soft); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  transition: background .12s ease, border-color .12s ease;
+}
+.update-card:hover { background: var(--surface-hover); border-color: var(--clay); }
+.update-card-icon { color: var(--clay); flex: 0 0 auto; }
+.update-card-icon svg { width: 17px; height: 17px; display: block; }
+.update-card-text { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+.update-card-title { font-size: calc(13px * var(--ui-font-scale, 1)); font-weight: 600; line-height: 1.2; }
+.update-card-ver { font-size: calc(11px * var(--ui-font-scale, 1)); color: var(--text-faint); line-height: 1.3; }
+.update-card-arrow { display: inline-flex; color: var(--text-muted); flex: 0 0 auto; }
+.update-card-arrow svg { width: 15px; height: 15px; }
+
+/* Selecting lays every tick box in one column at the row's left edge and moves
+   the tree's indent onto the titles instead: group rows keep caret + folder icon,
+   their conversations start under the group name, and nested rows indent one more
+   step. Guide lines stand in for the indent the tick column takes over. The
+   compact rail below has no tick column, so this stays out of it. */
+@media (min-width: 901px) {
+  .side-list.selecting .side-folder-sessions { position: relative; padding-left: 0; }
+  .side-list.selecting .side-folder-sessions::before,
+  .side-list.selecting .side-nest::before {
+    content: ""; position: absolute; z-index: 1; top: 2px; bottom: 2px; width: 1px;
+    background: var(--border); pointer-events: none;
+  }
+  .side-list.selecting .side-folder-sessions::before { left: 58px; }
+  .side-list.selecting .side-folder-sessions .side-item.ses { padding-left: 10px; }
+  .side-list.selecting .side-folder-sessions .side-item.ses .ses-title { margin-left: 36px; }
+  .side-list.selecting .side-nest,
+  .side-list.selecting .side-folder-sessions .side-nest {
+    position: relative; margin-left: 0; padding-left: 0; border-left: 0;
+  }
+  .side-list.selecting .side-nest::before { left: 46px; }
+  .side-list.selecting .side-folder-sessions .side-nest::before { left: 81px; }
+  .side-list.selecting .side-nest .side-item-wrap > .side-item.ses { padding-left: 10px; }
+  .side-list.selecting .side-nest .side-item.ses .ses-title { margin-left: 20px; }
+  .side-list.selecting .side-folder-sessions .side-nest .side-item.ses .ses-title { margin-left: 56px; }
+  .side-list.selecting .side-nest .side-exploration { padding-left: 55px; }
+  .side-list.selecting .side-folder-sessions .side-nest .side-exploration { padding-left: 91px; }
+}
+
+/* Keep the research canvas usable only when the window is genuinely narrow.
+   The Tauri window opens at 1100 CSS px; using that same value here made the
+   default workspace look like an icon rail and hid every saved-session title.
+   Preserve the full Wisp history sidebar at the normal window size, and use
+   the compact rail only below 900 px. */
+@media (max-width: 900px) {
+  .sidebar-resizer { display: none; }
+  .sidebar {
+    flex-basis: 56px;
+    width: 56px;
+    padding: 10px 6px;
+    overflow: visible;
+  }
+  /* A reserved scrollbar gutter would push every row left of the icon column;
+     the 56px rail scrolls by wheel/trackpad instead. */
+  .sidebar .side-list { overflow-x: hidden; scrollbar-gutter: auto; scrollbar-width: none; }
+  .sidebar-head {
+    flex-direction: column;
+    justify-content: flex-start;
+    align-items: center;
+    gap: 6px;
+    min-height: 0;
+    margin: 0;
+    padding: 2px 0 4px;
+    border-bottom: 0;
+  }
+  .sidebar-head .icon-btn { display: none; }
+  .sidebar .proj-name,
+  .sidebar .side-group-title,
+  .sidebar .side-sessions-head,
+  .sidebar .side-session-filters,
+  .sidebar .ses-status-label,
+  .sidebar .side-folder-caret,
+  .sidebar .side-folder-name,
+  .sidebar .side-folder-count,
+  .sidebar .ses-title,
+  .sidebar .session-actions,
+  .sidebar .folder-actions,
+  .sidebar .side-load-more,
+  .sidebar .side-hint,
+  .sidebar .proj-meta,
+  .sidebar .side-bulk-bar { display: none; }
+  .sidebar .side-back {
+    width: 32px;
+    height: 32px;
+  }
+  .sidebar .proj-switch {
+    flex: 0 0 auto;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    justify-content: center;
+  }
+  .sidebar .proj-switch::before {
+    content: "";
+    width: 18px;
+    height: 18px;
+    background: center / contain no-repeat url("logo.svg");
+  }
+  .sidebar .proj-menu {
+    position: fixed;
+    z-index: 80;
+    top: 12px;
+    left: 64px;
+    right: auto;
+    width: min(300px, calc(100vw - 80px));
+    max-height: min(70vh, 520px);
+  }
+  .sidebar .side-btn,
+  .sidebar .side-item,
+  .sidebar .side-folder {
+    justify-content: center;
+    align-items: center;
+    padding: 8px;
+    gap: 0;
+  }
+  .sidebar .side-btn {
+    font-size: 0;
+    line-height: 0;
+    min-height: 36px;
+    color: transparent;
+  }
+  .sidebar .side-btn-label,
+  .sidebar .side-shortcut,
+  .sidebar .nav-more-caret { display: none; }
+  .sidebar .side-btn > svg {
+    width: 17px;
+    height: 17px;
+    color: var(--text-muted);
+    opacity: .9;
+  }
+  .sidebar .side-btn:hover > svg,
+  .sidebar .side-btn.primary > svg { color: var(--text); }
+  .sidebar .side-item {
+    min-height: 32px;
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+  .sidebar .side-item .ses-status { margin: 0; }
+  /* Drop the right gutter kept for the (hidden here) row menu. */
+  .sidebar button.side-item.ses { padding-right: 8px; }
+  /* Titles are hidden here: show the title's initial at rest, and the
+     running / needs-you icon in its place while one applies. */
+  .sidebar .ses-initial {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 18px; height: 18px; font-size: calc(12px * var(--ui-font-scale, 1)); font-weight: 600; line-height: 1;
+  }
+  .sidebar .side-item.ses.active .ses-initial { color: var(--clay-strong); }
+  .sidebar .side-item.ses:not(.running):not(.attention) .ses-status,
+  .sidebar .side-item.ses.running .ses-initial,
+  .sidebar .side-item.ses.attention .ses-initial,
+  .sidebar .side-item.ses.selecting .ses-initial,
+  .sidebar .session-branch-icon { display: none; }
+  .sidebar .side-folder { min-height: 32px; }
+  .sidebar .side-folder > svg { margin: 0; }
+  .sidebar .side-folder-sessions { padding-left: 0; }
+  .sidebar .side-folder-sessions .side-item { padding-left: 8px; }
+  .sidebar .side-nest { margin-left: 0; padding-left: 4px; }
+  .sidebar .side-nest .side-item-wrap > .side-item { padding-left: 8px; }
+  .sidebar .side-nest-toggle,
+  .sidebar .side-nest-count,
+  .sidebar .side-exploration-copy { display: none; }
+  .sidebar .side-exploration { justify-content: center; padding: 8px; }
+  .sidebar .side-foot { padding-top: 8px; }
+  .sidebar .side-foot-actions { flex-direction: column; gap: 4px; padding: 0; }
+  .sidebar .side-foot-actions .side-btn { width: 100%; height: auto; padding: 8px; }
+  .sidebar .nav { gap: 4px; }
+}
+
+.side-shelved-btn svg { width: 15px; height: 15px; }

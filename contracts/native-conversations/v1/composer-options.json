@@ -1,0 +1,8 @@
+{
+  "session_id": "session-a",
+  "full_permission": false,
+  "delegation": false,
+  "auto_review": false,
+  "specialist": null,
+  "specialist_locked": false
+}

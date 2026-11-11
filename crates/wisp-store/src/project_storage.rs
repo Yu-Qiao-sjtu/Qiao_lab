@@ -1,0 +1,2646 @@
+//! Registered project databases are authoritative; the application database
+//! never serves as their fallback. Centralized projects keep their records in
+//! the application database alongside those registrations.
+use super::Store;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use sqlx::{Row, SqlitePool};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
+use tokio::sync::Mutex;
+
+pub(super) struct ProjectRegistry {
+    pub(super) global: SqlitePool,
+    pub(super) pools: Mutex<HashMap<String, SqlitePool>>,
+    deleting: std::sync::Mutex<HashSet<String>>,
+    read_only: bool,
+    migrate_on_open: bool,
+    entities: Mutex<HashMap<(String, String, String), String>>,
+    /// Cache-file fingerprints at the last folder publish/check, per project.
+    pub(super) published: std::sync::Mutex<HashMap<String, super::project_snapshots::Fingerprint>>,
+}
+
+/// Keeps project readers from reopening a database while its files are removed.
+/// Dropping the guard restores access after a failed or cancelled deletion.
+#[must_use]
+pub struct ProjectDatabaseDeleteGuard {
+    registry: Option<Arc<ProjectRegistry>>,
+    project_id: String,
+}
+
+impl Drop for ProjectDatabaseDeleteGuard {
+    fn drop(&mut self) {
+        if let Some(registry) = &self.registry {
+            registry.deleting.lock().unwrap().remove(&self.project_id);
+        }
+    }
+}
+
+pub const PROJECT_DATABASE: &str = ".wisp/project.sqlite";
+pub const PROJECT_METADATA: &str = ".wisp/project.json";
+const PROJECT_SETTING_PREFIXES: &[&str] = &[
+    "project_enabled_skills:",
+    "approval_scope:",
+    "tool_approvals:",
+    "skip_approval_connectors:",
+];
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct ProjectMetadata {
+    pub(super) format: String,
+    pub(super) version: u32,
+    pub(super) project_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MigrationMarker {
+    project_id: String,
+    application_database: String,
+    database_sha256: String,
+}
+
+pub(super) fn database_digest(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(hex::encode(hash.finalize()))
+}
+
+fn write_metadata(root: &Path, id: &str) -> Result<()> {
+    let metadata = ProjectMetadata {
+        format: "wisp-project".into(),
+        version: 1,
+        project_id: id.to_owned(),
+    };
+    let path = root.join(PROJECT_METADATA);
+    if path.exists() {
+        let existing: ProjectMetadata = serde_json::from_slice(&std::fs::read(&path)?)?;
+        anyhow::ensure!(
+            existing.project_id == id && existing.version == 1 && existing.format == "wisp-project",
+            "Conflicting project metadata"
+        );
+        return Ok(());
+    }
+    publish_metadata_file(&path, &serde_json::to_vec_pretty(&metadata)?)
+}
+
+fn publish_metadata_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let pending = path.with_file_name(format!("storage-write-{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::hard_link(&pending, path)?;
+    std::fs::remove_file(pending)?;
+    Ok(())
+}
+
+/// Copy shared columns between independent databases, ignoring retired source
+/// columns that upgraded databases may retain. Target-only columns use their
+/// defaults; SQLite still enforces required columns and other constraints.
+/// Preserve SQLite value types, NULLs and all historical epochs.
+pub(super) async fn insert_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table: &str,
+    rows: Vec<sqlx::sqlite::SqliteRow>,
+) -> Result<()> {
+    use sqlx::{Column, TypeInfo, ValueRef};
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let target_columns: std::collections::HashSet<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info(?)")
+            .bind(table)
+            .fetch_all(&mut **tx)
+            .await?
+            .into_iter()
+            .collect();
+    for row in rows {
+        let shared_columns = row
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| target_columns.contains(column.name()))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            !shared_columns.is_empty(),
+            "No shared columns to copy into {table}"
+        );
+        let columns = shared_columns
+            .iter()
+            .map(|(_, column)| format!("\"{}\"", column.name().replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
+            "INSERT INTO {table}({columns}) VALUES("
+        ));
+        let mut values = query.separated(",");
+        for (i, column) in shared_columns {
+            let value = row.try_get_raw(i)?;
+            if value.is_null() {
+                values.push_bind(None::<String>);
+            } else {
+                match value.type_info().name() {
+                    "INTEGER" => {
+                        values.push_bind(row.try_get::<i64, _>(i)?);
+                    }
+                    "REAL" => {
+                        values.push_bind(row.try_get::<f64, _>(i)?);
+                    }
+                    "BLOB" => {
+                        values.push_bind(row.try_get::<Vec<u8>, _>(i)?);
+                    }
+                    "TEXT" => {
+                        values.push_bind(row.try_get::<String, _>(i)?);
+                    }
+                    other => anyhow::bail!("Unsupported value type {other} for {}", column.name()),
+                }
+            }
+        }
+        query.push(")").build().execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+/// SQLITE_CORRUPT (11) or SQLITE_NOTADB (26) anywhere in the chain, in any
+/// extended form: the database file itself is unusable, not one statement.
+fn is_corrupt(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .and_then(|error| error.as_database_error())
+            .and_then(|error| error.code())
+            .and_then(|code| code.parse::<i64>().ok())
+            .is_some_and(|code| matches!(code & 0xff, 11 | 26))
+    })
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut full = path.as_os_str().to_owned();
+    full.push(suffix);
+    full.into()
+}
+
+/// Rename a database and its journal files; the WAL may still hold data worth
+/// salvaging by hand, and left beside a replacement it would corrupt that too.
+fn move_aside(database: &Path, aside: &Path) -> std::io::Result<()> {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        match std::fs::rename(with_suffix(database, suffix), with_suffix(aside, suffix)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn remove_database(database: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(with_suffix(database, suffix));
+    }
+}
+
+fn restore_copy(copy: &Path, database: &Path) -> std::io::Result<()> {
+    let pending = with_suffix(database, ".restoring");
+    std::fs::copy(copy, &pending)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&pending)?
+        .sync_all()?;
+    std::fs::rename(&pending, database)
+}
+
+impl Store {
+    /// Register an existing, self-contained workspace without requiring its
+    /// original application database. Metadata and database identity must agree.
+    pub async fn register_project_folder(&self, workspace: &Path) -> Result<String> {
+        anyhow::ensure!(
+            self.registry.is_some() && self.project_scope.is_none(),
+            "Application store required"
+        );
+        let workspace = std::fs::canonicalize(workspace)?;
+        for relative in [
+            ".wisp",
+            PROJECT_METADATA,
+            PROJECT_DATABASE,
+            super::project_snapshots::REVISIONS,
+        ] {
+            // Snapshot folders have no live database; v1 folders no revisions.
+            anyhow::ensure!(
+                !std::fs::symlink_metadata(workspace.join(relative))
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink()),
+                "Project metadata paths must not be symbolic links"
+            );
+        }
+        let metadata_path = workspace.join(PROJECT_METADATA);
+        anyhow::ensure!(
+            std::fs::metadata(&metadata_path)?.len() <= 64 * 1024,
+            "Project metadata is too large"
+        );
+        let metadata: ProjectMetadata = serde_json::from_slice(&std::fs::read(metadata_path)?)?;
+        anyhow::ensure!(
+            metadata.format == "wisp-project"
+                && matches!(
+                    metadata.version,
+                    1 | super::project_snapshots::SNAPSHOT_METADATA_VERSION
+                )
+                && !metadata.project_id.is_empty(),
+            "Unsupported project metadata"
+        );
+        if metadata.version == super::project_snapshots::SNAPSHOT_METADATA_VERSION {
+            return self
+                .register_snapshot_folder(&workspace, &metadata.project_id)
+                .await;
+        }
+        let database = workspace.join(PROJECT_DATABASE);
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&database)
+            .create_if_missing(false);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM projects")
+            .fetch_all(&pool)
+            .await?;
+        anyhow::ensure!(
+            ids == [metadata.project_id.clone()],
+            "Project metadata does not match its database"
+        );
+        // Before the write transaction, whose connection may be the only one.
+        super::upgrade_backup::before_migration(&pool, &self.pool, Some(&metadata.project_id))
+            .await;
+        let mut tx = self.begin_write().await?;
+        let existing: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?)")
+            .bind(&metadata.project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        anyhow::ensure!(!existing, "This project is already registered");
+        Self::migrate(&pool).await?;
+        let project = sqlx::query(
+            "SELECT name,description,workspace_dir,created_at,updated_at FROM projects WHERE id=?",
+        )
+        .bind(&metadata.project_id)
+        .fetch_one(&pool)
+        .await?;
+        let old_root: String = project.try_get("workspace_dir")?;
+        rebase_workspace_paths(&pool, &old_root, &workspace).await?;
+        sqlx::query("INSERT INTO projects(id,name,description,workspace_dir,created_at,updated_at) VALUES(?,?,?,?,?,?)")
+            .bind(&metadata.project_id).bind(project.try_get::<String,_>("name")?)
+            .bind(project.try_get::<String,_>("description")?).bind(workspace.to_string_lossy().as_ref())
+            .bind(project.try_get::<i64,_>("created_at")?).bind(project.try_get::<i64,_>("updated_at")?)
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO project_locations(project_id,database_path) VALUES(?,?)")
+            .bind(&metadata.project_id)
+            .bind(database.to_string_lossy().as_ref())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        pool.close().await;
+        Ok(metadata.project_id)
+    }
+    /// Production entry point. Upgrade schemas and register project routing, but
+    /// keep legacy records in place: copying the application database here blocks
+    /// desktop setup before the window can render or process Windows messages.
+    pub async fn open_application(path: &Path) -> Result<Self> {
+        let mut store = Self::open(path).await?;
+        // v1.15 created this table even with no projects or failed migrations.
+        // Detect it before creating it, and persist the inferred preference in
+        // the same transaction so a crash cannot turn a fresh install into v1.15.
+        let mut tx = store.begin_write().await?;
+        let used_project_storage: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_locations')",
+        ).fetch_one(&mut *tx).await?;
+        sqlx::query("INSERT INTO settings(key,value) VALUES('decentralized_project_storage',?) ON CONFLICT(key) DO NOTHING")
+            .bind(used_project_storage.to_string()).execute(&mut *tx).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS project_locations (project_id TEXT PRIMARY KEY, database_path TEXT NOT NULL UNIQUE)")
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        // Memory content is application-wide; its optional source is now a
+        // cross-database reference and cannot be a SQLite foreign key.
+        if !sqlx::query("PRAGMA foreign_key_list(global_memories)")
+            .fetch_all(&store.pool)
+            .await?
+            .is_empty()
+        {
+            let mut tx = store.begin_write().await?;
+            for sql in [
+                "CREATE TABLE global_memories_registry(id TEXT PRIMARY KEY,content TEXT NOT NULL CHECK(length(trim(content))>0),source_frame_id TEXT,source_turn_index INTEGER CHECK(source_turn_index IS NULL OR source_turn_index>=0),created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)",
+                "INSERT INTO global_memories_registry SELECT * FROM global_memories",
+                "DROP TABLE global_memories",
+                "ALTER TABLE global_memories_registry RENAME TO global_memories",
+                "CREATE INDEX ix_global_memories_updated ON global_memories(updated_at DESC,id DESC)",
+            ] { sqlx::query(sql).execute(&mut *tx).await?; }
+            tx.commit().await?;
+        }
+        store.enable_project_registry(false).await?;
+        if let Some(registry) = store.registry.as_mut().and_then(Arc::get_mut) {
+            registry.migrate_on_open = true;
+        }
+        let locations: Vec<(String, String)> =
+            sqlx::query_as("SELECT project_id,database_path FROM project_locations")
+                .fetch_all(&store.pool)
+                .await?;
+        for (id, path) in locations {
+            let database = Path::new(&path);
+            if let Some(root) = database.parent().and_then(Path::parent) {
+                let marker = root.join(".wisp/storage-migration.json");
+                if marker.exists() && database.is_file() {
+                    write_metadata(root, &id)?;
+                    std::fs::remove_file(marker)?;
+                }
+            }
+        }
+        // Scratch chat was removed. Its hidden projects were deleted on close,
+        // so only a crashed session can have left one; it must not surface as
+        // an ordinary project. The desktop deletes the sandbox directories.
+        let scratch: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM projects WHERE id LIKE 'scratch:%'")
+                .fetch_all(&store.pool)
+                .await?;
+        for id in scratch {
+            if let Err(error) = store.delete_project(&id).await {
+                tracing::warn!(project_id = %id, %error, "Failed to delete a leftover scratch project");
+            }
+        }
+        Ok(store)
+    }
+
+    /// Preference for newly created/imported records. Existing registered
+    /// databases always retain their authoritative routing, even when disabled.
+    pub async fn decentralized_project_storage(&self) -> Result<bool> {
+        Ok(self
+            .get_setting("decentralized_project_storage")
+            .await?
+            .as_deref()
+            == Some("true"))
+    }
+
+    pub(super) async fn enable_project_registry(&mut self, read_only: bool) -> Result<()> {
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_locations')")
+            .fetch_one(&self.pool).await?;
+        if exists {
+            self.registry = Some(Arc::new(ProjectRegistry {
+                global: self.pool.clone(),
+                pools: Mutex::new(HashMap::new()),
+                deleting: std::sync::Mutex::new(HashSet::new()),
+                read_only,
+                migrate_on_open: false,
+                entities: Mutex::new(HashMap::new()),
+                published: std::sync::Mutex::new(HashMap::new()),
+            }));
+        }
+        Ok(())
+    }
+
+    pub(super) fn route_global(&self) -> Option<Self> {
+        let registry = self.registry.as_ref()?;
+        self.project_scope.as_ref()?;
+        Some(Self {
+            pool: registry.global.clone(),
+            registry: self.registry.clone(),
+            project_scope: None,
+        })
+    }
+
+    /// Recovery check for removing an offline registration without touching its
+    /// files. Only a missing registered database qualifies; corrupt databases,
+    /// permission errors and centralized projects still require normal checks.
+    pub async fn project_database_is_missing(&self, id: &str) -> Result<bool> {
+        let Some(registry) = &self.registry else {
+            return Ok(false);
+        };
+        anyhow::ensure!(self.project_scope.is_none(), "Application store required");
+        let path: Option<String> =
+            sqlx::query_scalar("SELECT database_path FROM project_locations WHERE project_id=?")
+                .bind(id)
+                .fetch_optional(&registry.global)
+                .await?;
+        let Some(path) = path else { return Ok(false) };
+        match tokio::fs::metadata(&path).await {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error).with_context(|| format!("Inspect project database: {path}")),
+        }
+    }
+
+    pub(super) async fn route_project(&self, id: &str) -> Result<Option<Self>> {
+        let Some(registry) = &self.registry else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            !registry.deleting.lock().unwrap().contains(id),
+            "Project {id} deletion is in progress"
+        );
+        if let Some(scope) = &self.project_scope {
+            anyhow::ensure!(
+                scope == id,
+                "cross-project access requires the application store"
+            );
+            return Ok(None);
+        }
+        let path: Option<String> =
+            sqlx::query_scalar("SELECT database_path FROM project_locations WHERE project_id=?")
+                .bind(id)
+                .fetch_optional(&registry.global)
+                .await?;
+        let Some(path) = path else { return Ok(None) };
+        // Every routed call passes here, including a turn's event writers. The
+        // database may sit on a slow volume, so stat it off the runtime threads
+        // (#1668).
+        let available = tokio::fs::metadata(&path)
+            .await
+            .is_ok_and(|metadata| metadata.is_file());
+        anyhow::ensure!(
+            available,
+            "Project {id} database is unavailable: {path}. Reconnect the workspace or, if it \
+             was deleted, choose Delete → Remove from Wisp only in the desktop project list. \
+             Resume this action from an available project."
+        );
+        let mut pools = registry.pools.lock().await;
+        // Deletion can start while the metadata check above is in flight.
+        anyhow::ensure!(
+            !registry.deleting.lock().unwrap().contains(id),
+            "Project {id} deletion is in progress"
+        );
+        if !pools.contains_key(id) {
+            let database = Path::new(&path);
+            let pool = match Self::open_project_pool(registry, id, database).await {
+                Ok(pool) => pool,
+                Err(error) if registry.migrate_on_open && is_corrupt(&error) => {
+                    return Err(
+                        Self::recover_project_database(registry, id, database, error).await,
+                    );
+                }
+                Err(error) => return Err(error),
+            };
+            pools.insert(id.to_owned(), pool);
+        }
+        Ok(Some(Self {
+            pool: pools[id].clone(),
+            registry: self.registry.clone(),
+            project_scope: Some(id.to_owned()),
+        }))
+    }
+
+    async fn open_project_pool(
+        registry: &ProjectRegistry,
+        id: &str,
+        database: &Path,
+    ) -> Result<SqlitePool> {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(database)
+            .create_if_missing(false)
+            .read_only(registry.read_only)
+            .busy_timeout(std::time::Duration::from_secs(5));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await?;
+        let opened: Result<()> = async {
+            if registry.migrate_on_open {
+                super::upgrade_backup::before_migration(&pool, &registry.global, Some(id)).await;
+                Self::migrate(&pool).await?;
+            }
+            let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM projects")
+                .fetch_all(&pool)
+                .await?;
+            anyhow::ensure!(ids == [id], "Project database identity mismatch: {id}");
+            Ok(())
+        }
+        .await;
+        if let Err(error) = opened {
+            // Release the file before recovery moves it aside.
+            Self::close_pool(&pool).await;
+            return Err(error);
+        }
+        Ok(pool)
+    }
+
+    /// A database SQLite reports as damaged is moved aside, keeping its WAL,
+    /// and the newest backup copy that opens takes its place; with no copy, an
+    /// empty database carrying the project row does. The error returned names
+    /// which happened and where the damaged file is (#1610); the project opens
+    /// normally on the next attempt. Workspace files are never touched.
+    async fn recover_project_database(
+        registry: &ProjectRegistry,
+        id: &str,
+        database: &Path,
+        cause: anyhow::Error,
+    ) -> anyhow::Error {
+        let name = database
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        let aside = database.with_file_name(format!(
+            "{name}.corrupt-{}",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        ));
+        if let Err(error) = move_aside(database, &aside) {
+            return cause.context(format!(
+                "Project database is damaged and could not be moved aside: {error}"
+            ));
+        }
+        tracing::error!(project_id = %id, damaged = %aside.display(), %cause, "Project database is damaged");
+        let owner = match super::upgrade_backup::database_file(&registry.global).await {
+            Ok(Some(owner)) => owner,
+            _ => std::path::PathBuf::new(),
+        };
+        for copy in super::upgrade_backup::copies_of(&owner, database, Some(id)) {
+            let copy_name = copy
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+            if let Err(error) = restore_copy(&copy, database) {
+                tracing::warn!(copy = %copy.display(), %error, "Backup copy could not be restored");
+                continue;
+            }
+            match Self::open_project_pool(registry, id, database).await {
+                Ok(pool) => {
+                    Self::close_pool(&pool).await;
+                    tracing::warn!(project_id = %id, copy = %copy_name, "Project database restored from its backup copy");
+                    return anyhow::anyhow!(
+                        "project_database_restored:{copy_name}:{}",
+                        aside.display()
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(copy = %copy.display(), %error, "Backup copy does not open either");
+                    remove_database(database);
+                }
+            }
+        }
+        match Self::rebuild_project_database(registry, id, database).await {
+            Ok(()) => anyhow::anyhow!("project_database_rebuilt:{}", aside.display()),
+            Err(error) => error.context(format!(
+                "Project database is damaged; it was moved to {} and no replacement could be made",
+                aside.display()
+            )),
+        }
+    }
+
+    async fn rebuild_project_database(
+        registry: &ProjectRegistry,
+        id: &str,
+        database: &Path,
+    ) -> Result<()> {
+        let project = sqlx::query(
+            "SELECT COALESCE(name,'') AS name,COALESCE(description,'') AS description,\
+             COALESCE(workspace_dir,'') AS workspace_dir,created_at,updated_at FROM projects WHERE id=?",
+        )
+        .bind(id)
+        .fetch_one(&registry.global)
+        .await?;
+        let store = Store::open_with_journal(database, true).await?;
+        sqlx::query("INSERT INTO projects(id,name,description,workspace_dir,created_at,updated_at) VALUES(?,?,?,?,?,?)")
+            .bind(id)
+            .bind(project.try_get::<String, _>("name")?)
+            .bind(project.try_get::<String, _>("description")?)
+            .bind(project.try_get::<String, _>("workspace_dir")?)
+            .bind(project.try_get::<i64, _>("created_at")?)
+            .bind(project.try_get::<i64, _>("updated_at")?)
+            .execute(&store.pool)
+            .await?;
+        Self::close_pool(&store.pool).await;
+        Ok(())
+    }
+
+    pub(super) async fn routed_projects(&self) -> Result<Option<Vec<Self>>> {
+        self.collect_projects(false).await
+    }
+
+    /// Listing and background maintenance must survive one offline folder
+    /// (unplugged disk, moved workspace). Its registration row still lists the
+    /// project, and opening it fails explicitly. Searches and cross-project
+    /// safety checks keep using `routed_projects`, which fails instead.
+    pub(super) async fn available_projects(&self) -> Result<Option<Vec<Self>>> {
+        self.collect_projects(true).await
+    }
+
+    async fn collect_projects(&self, skip_unavailable: bool) -> Result<Option<Vec<Self>>> {
+        if self.registry.is_none() || self.project_scope.is_some() {
+            return Ok(None);
+        }
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT project_id FROM project_locations ORDER BY project_id")
+                .fetch_all(&self.pool)
+                .await?;
+        let mut stores = Vec::new();
+        for id in ids {
+            match self.route_project(&id).await {
+                Ok(Some(store)) => stores.push(store),
+                Ok(None) => {}
+                Err(error) if skip_unavailable => {
+                    tracing::warn!(project_id=%id, %error, "Skipping unavailable project database");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // Legacy/unregistered records may still exist after an interrupted
+        // migration. They are a separate source, never a fallback for a location.
+        stores.push(Self {
+            pool: self.pool.clone(),
+            registry: None,
+            project_scope: None,
+        });
+        Ok(Some(stores))
+    }
+
+    pub(super) async fn route_entity(
+        &self,
+        table: &str,
+        column: &str,
+        id: &str,
+    ) -> Result<Option<Self>> {
+        let Some(registry) = &self.registry else {
+            return Ok(None);
+        };
+        if self.project_scope.is_some() {
+            return Ok(None);
+        }
+        // A global frame supplies its owner even when optional session records
+        // do not exist. Resolve that owner before scanning unrelated databases.
+        // Leftover global rows are only routing hints: a registered database
+        // remains authoritative, including when it is offline or lacks the frame.
+        if table == "frames" && column == "id" {
+            let owner: Option<String> =
+                sqlx::query_scalar("SELECT project_id FROM frames WHERE id=?")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            if let Some(owner) = owner {
+                return self.route_project(&owner).await;
+            }
+        }
+        // Identifiers are compile-time constants at the call sites, never input.
+        let sql = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column}=?)");
+        let key = (table.to_owned(), column.to_owned(), id.to_owned());
+        let cached = registry.entities.lock().await.get(&key).cloned();
+        if let Some(project) = cached {
+            if let Some(store) = self.route_project(&project).await? {
+                if sqlx::query_scalar::<_, bool>(&sql)
+                    .bind(id)
+                    .fetch_one(&store.pool)
+                    .await?
+                {
+                    return Ok(Some(store));
+                }
+            }
+            registry.entities.lock().await.remove(&key);
+        }
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT project_id FROM project_locations ORDER BY project_id")
+                .fetch_all(&self.pool)
+                .await?;
+        let mut unavailable = None;
+        for project in ids {
+            let store = match self.route_project(&project).await {
+                Ok(Some(store)) => store,
+                Ok(None) => continue,
+                Err(error) => {
+                    unavailable = Some(error);
+                    continue;
+                }
+            };
+            if sqlx::query_scalar::<_, bool>(&sql)
+                .bind(id)
+                .fetch_one(&store.pool)
+                .await?
+            {
+                registry.entities.lock().await.insert(key, project);
+                return Ok(Some(store));
+            }
+        }
+        if let Some(error) = unavailable {
+            return Err(error);
+        }
+        Ok(None)
+    }
+
+    pub(super) async fn route_setting(&self, key: &str) -> Result<Option<Self>> {
+        for prefix in super::explorations::FRAME_SETTING_PREFIXES {
+            if let Some(id) = key.strip_prefix(prefix) {
+                return self.route_entity("frames", "id", id).await;
+            }
+        }
+        for prefix in PROJECT_SETTING_PREFIXES {
+            if let Some(id) = key.strip_prefix(prefix) {
+                return self.route_project(id).await;
+            }
+        }
+        if let Some(rest) = key.strip_prefix("acp.config_options.") {
+            if let Some((id, _)) = rest.split_once('.') {
+                return self.route_entity("frames", "id", id).await;
+            }
+        }
+        Ok(self.route_global())
+    }
+
+    pub(super) async fn retain_environment_snapshot(&self, hash: Option<&str>) -> Result<()> {
+        let (Some(hash), Some(global)) = (hash, self.route_global()) else {
+            return Ok(());
+        };
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM env_snapshots WHERE hash=?)")
+                .bind(hash)
+                .fetch_one(&self.pool)
+                .await?;
+        if !exists {
+            let rows = sqlx::query("SELECT * FROM env_snapshots WHERE hash=?")
+                .bind(hash)
+                .fetch_all(&global.pool)
+                .await?;
+            let mut tx = self.begin_write().await?;
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM env_snapshots WHERE hash=?)")
+                    .bind(hash)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if !exists {
+                insert_rows(&mut tx, "env_snapshots", rows).await?;
+            }
+            tx.commit().await?;
+        }
+        Ok(())
+    }
+
+    /// Drain this project's connections before deleting workspace files. The
+    /// registration stays available for removal or retry, and other projects
+    /// retain their own connections throughout the operation.
+    pub async fn begin_project_database_deletion(
+        &self,
+        id: &str,
+    ) -> Result<ProjectDatabaseDeleteGuard> {
+        anyhow::ensure!(self.project_scope.is_none(), "Application store required");
+        let Some(registry) = &self.registry else {
+            return Ok(ProjectDatabaseDeleteGuard {
+                registry: None,
+                project_id: id.to_owned(),
+            });
+        };
+        let mut pools = registry.pools.lock().await;
+        anyhow::ensure!(
+            registry.deleting.lock().unwrap().insert(id.to_owned()),
+            "Project {id} deletion is already in progress"
+        );
+        let guard = ProjectDatabaseDeleteGuard {
+            registry: self.registry.clone(),
+            project_id: id.to_owned(),
+        };
+        let pool = pools.remove(id);
+        drop(pools);
+        if let Some(pool) = pool {
+            Self::close_pool(&pool).await;
+            anyhow::ensure!(
+                pool.size() == 0,
+                "Project {id} database connections are still closing"
+            );
+        }
+        Ok(guard)
+    }
+
+    /// Detach only the registration. The project database and files survive.
+    pub(super) async fn unregister_project_storage(&self, id: &str) -> Result<bool> {
+        if self.registry.is_none() || self.project_scope.is_some() {
+            return Ok(false);
+        }
+        let mut tx = self.begin_write().await?;
+        let affected = sqlx::query("DELETE FROM project_locations WHERE project_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM project_sync_state WHERE project_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM projects WHERE id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        if let Some(registry) = &self.registry {
+            // Release file handles so a removed project folder can be moved
+            // or deleted, including on Windows.
+            let pool = registry.pools.lock().await.remove(id);
+            if let Some(pool) = pool {
+                Self::close_pool(&pool).await;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Migrate without the portable export's runtime sanitization. Work on a
+    /// private snapshot, prune other projects, validate, then publish and cut over.
+    pub async fn migrate_project_storage(&self, id: &str) -> Result<()> {
+        self.prepare_project_storage(id, None).await
+    }
+
+    /// A transaction containing a newly inserted project lets creation seed an
+    /// empty database without copying unrelated history. Publish the project
+    /// and its location atomically, without an intermediate legacy registration.
+    pub(super) async fn prepare_project_storage(
+        &self,
+        id: &str,
+        new_project: Option<sqlx::Transaction<'static, sqlx::Sqlite>>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.registry.is_some() && self.project_scope.is_none(),
+            "Application store required"
+        );
+        if self.route_project(id).await?.is_some() {
+            return Ok(());
+        }
+        let is_new = new_project.is_some();
+        let mut cutover = match new_project {
+            Some(tx) => tx,
+            None => self.begin_write().await?,
+        };
+        let (_, workspace): (String, String) =
+            sqlx::query_as("SELECT name,workspace_dir FROM projects WHERE id=?")
+                .bind(id)
+                .fetch_one(&mut *cutover)
+                .await?;
+        anyhow::ensure!(
+            !workspace.trim().is_empty(),
+            "Project {id} has no workspace"
+        );
+        let root = Path::new(&workspace);
+        anyhow::ensure!(
+            root.is_dir(),
+            "Project {id} workspace is unavailable: {workspace}"
+        );
+        let directory = root.join(".wisp");
+        std::fs::create_dir_all(&directory)?;
+        let destination = root.join(PROJECT_DATABASE);
+        let metadata_path = root.join(PROJECT_METADATA);
+        let marker_path = directory.join("storage-migration.json");
+        let application_database = self.database_path().await?.to_string_lossy().into_owned();
+        if marker_path.exists() {
+            let marker: MigrationMarker = serde_json::from_slice(&std::fs::read(&marker_path)?)?;
+            anyhow::ensure!(
+                marker.project_id == id
+                    && marker.application_database == application_database
+                    && !metadata_path.exists(),
+                "Unfinished project migration belongs to another source"
+            );
+            if destination.exists() {
+                anyhow::ensure!(
+                    database_digest(&destination)? == marker.database_sha256,
+                    "Unfinished project database was modified; preserve it for recovery"
+                );
+                std::fs::remove_file(&destination)?;
+            }
+            std::fs::remove_file(&marker_path)?;
+        }
+        anyhow::ensure!(
+            !destination.exists() && !metadata_path.exists(),
+            "Project storage already exists; register it instead: {}",
+            root.display()
+        );
+        let staging = Path::new(&application_database)
+            .with_file_name(format!("project-migration-{}.sqlite", uuid::Uuid::new_v4()));
+        let prepared = directory.join(format!("project-migration-{}.sqlite", uuid::Uuid::new_v4()));
+        let mut staging_pool = None;
+        let result: Result<()> = async {
+            // Explicit migration still snapshots legacy history. New projects only
+            // need their own registration, even when the global database is huge.
+            if !is_new {
+                sqlx::query("VACUUM INTO ?")
+                    .bind(staging.to_string_lossy().as_ref())
+                    .execute(&self.pool)
+                    .await?;
+            }
+            let local = Self::open_snapshot(&staging).await?;
+            staging_pool = Some(local.pool.clone());
+            if is_new {
+                let project = sqlx::query("SELECT * FROM projects WHERE id=?")
+                    .bind(id)
+                    .fetch_all(&mut *cutover)
+                    .await?;
+                let mut tx = local.begin_write().await?;
+                insert_rows(&mut tx, "projects", project).await?;
+                sqlx::query("CREATE TABLE project_locations (project_id TEXT PRIMARY KEY, database_path TEXT NOT NULL UNIQUE)")
+                    .execute(&mut *tx).await?;
+                tx.commit().await?;
+            }
+            let others: Vec<String> = sqlx::query_scalar("SELECT id FROM projects WHERE id<>?")
+                .bind(id)
+                .fetch_all(&local.pool)
+                .await?;
+            for other in others {
+                local.delete_project(&other).await?;
+            }
+            let mut tx = local.begin_write().await?;
+            // These bindings reference device-owned records. Keep the identifiers
+            // without duplicating device credentials/configuration into a project.
+            for statement in [
+                "CREATE TABLE project_plugins_local(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,plugin_id TEXT NOT NULL,version TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),grants_json TEXT NOT NULL DEFAULT '{}',updated_at INTEGER NOT NULL,PRIMARY KEY(project_id,plugin_id))",
+                "INSERT INTO project_plugins_local SELECT * FROM project_plugins",
+                "DROP TABLE project_plugins",
+                "ALTER TABLE project_plugins_local RENAME TO project_plugins",
+                "CREATE INDEX ix_project_plugins_enabled ON project_plugins(project_id,enabled,plugin_id)",
+                "CREATE TABLE session_execution_contexts_local(frame_id TEXT NOT NULL REFERENCES frames(id) ON DELETE CASCADE,context_id TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(frame_id,context_id))",
+                "INSERT INTO session_execution_contexts_local SELECT * FROM session_execution_contexts",
+                "DROP TABLE session_execution_contexts",
+                "ALTER TABLE session_execution_contexts_local RENAME TO session_execution_contexts",
+                "CREATE INDEX ix_session_execution_contexts_context ON session_execution_contexts(context_id)",
+            ] { sqlx::query(statement).execute(&mut *tx).await?; }
+            // Only frame-specific settings belong to the project. Global account,
+            // provider, device and discovery configuration must not follow it.
+            let keys: Vec<String> = sqlx::query_scalar("SELECT key FROM settings")
+                .fetch_all(&mut *tx)
+                .await?;
+            let mut project_settings = Vec::new();
+            for key in keys {
+                let frame = super::explorations::FRAME_SETTING_PREFIXES
+                    .iter()
+                    .find_map(|p| key.strip_prefix(p))
+                    .or_else(|| {
+                        key.strip_prefix("acp.config_options.")
+                            .and_then(|rest| rest.split_once('.').map(|(id, _)| id))
+                    });
+                let keep = if let Some(frame) = frame {
+                    sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM frames WHERE id=?)")
+                        .bind(frame)
+                        .fetch_one(&mut *tx)
+                        .await?
+                } else {
+                    PROJECT_SETTING_PREFIXES
+                        .iter()
+                        .any(|prefix| key.strip_prefix(prefix) == Some(id))
+                };
+                if !keep {
+                    sqlx::query("DELETE FROM settings WHERE key=?")
+                        .bind(key)
+                        .execute(&mut *tx)
+                        .await?;
+                } else {
+                    project_settings.push(key);
+                }
+            }
+            sqlx::query("DELETE FROM env_snapshots WHERE hash NOT IN (SELECT env_hash FROM execution_log WHERE env_hash IS NOT NULL UNION SELECT env_snapshot_hash FROM artifact_versions WHERE env_snapshot_hash IS NOT NULL UNION SELECT env_snapshot_hash FROM run_environment_snapshots)").execute(&mut *tx).await?;
+            for table in [
+                "project_locations",
+                "project_sync_state",
+                "global_memories",
+                "external_session_cache",
+                "plugin_installations",
+                "execution_contexts",
+            ] {
+                sqlx::query(&format!("DELETE FROM {table}"))
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+                .fetch_one(&local.pool)
+                .await?;
+            anyhow::ensure!(
+                integrity == "ok",
+                "Project migration failed integrity check: {integrity}"
+            );
+            sqlx::query("VACUUM").execute(&local.pool).await?;
+            local.pool.close().await;
+            // Only a fully sanitized database enters the workspace. Publish the
+            // database before committing its registration, and the manifest last.
+            std::fs::copy(&staging, &prepared)?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&prepared)?
+                .sync_all()?;
+            let marker = MigrationMarker {
+                project_id: id.to_owned(),
+                application_database,
+                database_sha256: database_digest(&prepared)?,
+            };
+            publish_metadata_file(&marker_path, &serde_json::to_vec(&marker)?)?;
+            std::fs::hard_link(&prepared, &destination).context("publish project database")?;
+            std::fs::remove_file(&prepared)?;
+            sqlx::query("INSERT INTO project_locations(project_id,database_path) VALUES(?,?)")
+                .bind(id)
+                .bind(destination.to_string_lossy().as_ref())
+                .execute(&mut *cutover)
+                .await?;
+            let memory_sources: Vec<(String,String)> = sqlx::query_as("SELECT id,source_frame_id FROM global_memories WHERE source_frame_id IN (SELECT id FROM frames WHERE project_id=?)")
+                .bind(id).fetch_all(&mut *cutover).await?;
+            if !is_new {
+                super::project_transfer::delete_project_children(&mut cutover, id).await?;
+            }
+            for (memory, frame) in memory_sources {
+                sqlx::query("UPDATE global_memories SET source_frame_id=? WHERE id=?")
+                    .bind(frame)
+                    .bind(memory)
+                    .execute(&mut *cutover)
+                    .await?;
+            }
+            for key in project_settings {
+                sqlx::query("DELETE FROM settings WHERE key=?")
+                    .bind(key)
+                    .execute(&mut *cutover)
+                    .await?;
+            }
+            cutover.commit().await?;
+            write_metadata(root, id)?;
+            std::fs::remove_file(marker_path)?;
+            Ok(())
+        }
+        .await;
+        // Await rollback/connection shutdown before unlinking on Windows, even
+        // when preparation failed with an active transaction. Keep published
+        // databases and their recovery markers; only these private files are
+        // disposable on every exit path.
+        if let Some(pool) = staging_pool {
+            Self::close_pool(&pool).await;
+        }
+        for path in [&staging, &prepared] {
+            if let Err(error) = std::fs::remove_file(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %path.display(), %error, "Failed to remove project migration temporary file");
+                }
+            }
+        }
+        result
+    }
+}
+
+/// Rebind only paths under the previous workspace. Remote URIs and references
+/// outside it keep their meaning; historical JSON/log contents remain immutable.
+async fn rebase_workspace_paths(pool: &SqlitePool, old: &str, workspace: &Path) -> Result<()> {
+    let new = workspace.to_string_lossy();
+    let old = old.replace('\\', "/").trim_end_matches('/').to_owned();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for (table, column) in [
+        ("artifacts", "storage_path"),
+        ("artifact_versions", "storage_path"),
+        ("runs", "script_path"),
+        ("runs", "logs_path"),
+        ("context_archives", "storage_path"),
+        ("explorations", "workspace_dir"),
+        ("run_code_snapshots", "source_path"),
+        ("run_code_snapshots", "storage_path"),
+        ("run_inputs", "source_ref"),
+        ("run_outputs", "source_path"),
+        ("turn_file_undo", "path"),
+        ("turn_file_undo", "before_snapshot_path"),
+        ("acp_sessions", "cwd"),
+    ] {
+        let columns = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(&mut *tx)
+            .await?;
+        if !columns.iter().any(|r| r.get::<String, _>("name") == column) {
+            continue;
+        }
+        let rows = sqlx::query(&format!(
+            "SELECT rowid,{column} AS path FROM {table} WHERE {column} IS NOT NULL"
+        ))
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in rows {
+            let path: String = row.try_get("path")?;
+            let normalized = path.replace('\\', "/");
+            let windows = old.as_bytes().get(1) == Some(&b':') || old.starts_with("//");
+            let (candidate, prefix) = if windows {
+                (normalized.to_lowercase(), old.to_lowercase())
+            } else {
+                (normalized.clone(), old.clone())
+            };
+            if candidate == prefix || candidate.starts_with(&format!("{prefix}/")) {
+                let suffix = normalized[old.len()..].trim_start_matches('/');
+                let rebound = workspace.join(suffix);
+                sqlx::query(&format!("UPDATE {table} SET {column}=? WHERE rowid=?"))
+                    .bind(rebound.to_string_lossy().as_ref())
+                    .bind(row.try_get::<i64, _>("rowid")?)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+    }
+    sqlx::query("UPDATE projects SET workspace_dir=?")
+        .bind(new.as_ref())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn open_portable_application(path: &Path) -> Result<Store> {
+        let store = Store::open_application(path).await?;
+        store
+            .set_setting("decentralized_project_storage", "true")
+            .await?;
+        Ok(store)
+    }
+
+    fn assert_no_migration_files(directory: &Path) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            assert!(
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("project-migration-"),
+                "Leaked migration file: {}",
+                entry.path().display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_rows_copies_shared_columns_by_name_and_preserves_values() {
+        let source = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let target = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE copied (id INTEGER, obsolete TEXT, text_value TEXT, int_value INTEGER, real_value REAL, blob_value BLOB, null_value TEXT)")
+            .execute(&source).await.unwrap();
+        // Different order, a removed column, and a new column with a default.
+        sqlx::query("CREATE TABLE copied (blob_value BLOB, real_value REAL, int_value INTEGER, text_value TEXT, null_value TEXT, id INTEGER PRIMARY KEY, added TEXT NOT NULL DEFAULT 'default')")
+            .execute(&target).await.unwrap();
+        sqlx::query("INSERT INTO copied VALUES(1,'legacy','text',9223372036854775807,1.25,X'00FF',NULL),(2,'other','',-42,-0.5,X'',NULL)")
+            .execute(&source).await.unwrap();
+        let rows = sqlx::query("SELECT * FROM copied ORDER BY id")
+            .fetch_all(&source)
+            .await
+            .unwrap();
+        let mut tx = target.begin().await.unwrap();
+        insert_rows(&mut tx, "copied", rows).await.unwrap();
+        tx.commit().await.unwrap();
+        let rows = sqlx::query("SELECT * FROM copied ORDER BY id")
+            .fetch_all(&target)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        for (row, id, text, integer, real, blob) in [
+            (&rows[0], 1, "text", i64::MAX, 1.25, vec![0, 255]),
+            (&rows[1], 2, "", -42, -0.5, vec![]),
+        ] {
+            assert_eq!(row.get::<i64, _>("id"), id);
+            assert_eq!(row.get::<String, _>("text_value"), text);
+            assert_eq!(row.get::<i64, _>("int_value"), integer);
+            assert_eq!(row.get::<f64, _>("real_value"), real);
+            assert_eq!(row.get::<Vec<u8>, _>("blob_value"), blob);
+            assert_eq!(row.get::<Option<String>, _>("null_value"), None);
+            assert_eq!(row.get::<String, _>("added"), "default");
+        }
+        source.close().await;
+        target.close().await;
+    }
+
+    #[tokio::test]
+    async fn insert_rows_rejects_missing_required_columns_and_disjoint_schemas() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE copied (id INTEGER PRIMARY KEY, required TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (select, expected) in [
+            (
+                "SELECT 1 AS id, 'legacy' AS obsolete",
+                "NOT NULL constraint failed",
+            ),
+            ("SELECT 'legacy' AS obsolete", "No shared columns"),
+        ] {
+            let rows = sqlx::query(select).fetch_all(&pool).await.unwrap();
+            let mut tx = pool.begin().await.unwrap();
+            let error = insert_rows(&mut tx, "copied", rows).await.unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+            tx.rollback().await.unwrap();
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM copied")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn storage_preference_defaults_follow_upgrade_origin_and_persist() {
+        for from_v115 in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("global.sqlite");
+            let legacy = Store::open(&path).await.unwrap();
+            if from_v115 {
+                // Empty registry also identifies a v1.15 install whose projects
+                // were never migrated (or whose migration failed).
+                sqlx::query("CREATE TABLE project_locations (project_id TEXT PRIMARY KEY, database_path TEXT NOT NULL UNIQUE)")
+                    .execute(&legacy.pool).await.unwrap();
+            }
+            legacy.pool.close().await;
+            for _ in 0..2 {
+                let store = Store::open_application(&path).await.unwrap();
+                assert_eq!(
+                    store.decentralized_project_storage().await.unwrap(),
+                    from_v115
+                );
+                store.pool.close().await;
+            }
+            let store = Store::open_application(&path).await.unwrap();
+            store
+                .set_setting("decentralized_project_storage", &(!from_v115).to_string())
+                .await
+                .unwrap();
+            store.pool.close().await;
+            let reopened = Store::open_application(&path).await.unwrap();
+            assert_eq!(
+                reopened.decentralized_project_storage().await.unwrap(),
+                !from_v115
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn switching_storage_only_changes_new_projects_and_preserves_history() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("global.sqlite");
+        let store = Store::open_application(&path).await.unwrap();
+        assert!(!store.decentralized_project_storage().await.unwrap());
+        for (id, enabled) in [
+            ("central", false),
+            ("portable", true),
+            ("central-again", false),
+        ] {
+            store
+                .set_setting("decentralized_project_storage", &enabled.to_string())
+                .await
+                .unwrap();
+            let workspace = root.path().join(id);
+            store
+                .create_project(id, id, workspace.to_str().unwrap())
+                .await
+                .unwrap();
+            store.create_frame(id, id, "agent", "model").await.unwrap();
+            store
+                .append_message(id, 1, &wisp_llm::Message::user("retained history"))
+                .await
+                .unwrap();
+            assert_eq!(workspace.join(PROJECT_DATABASE).exists(), enabled);
+        }
+        // Reopening while disabled must still route portable history and writes.
+        let reopened = Store::open_application(&path).await.unwrap();
+        for id in ["central", "portable", "central-again"] {
+            assert_eq!(reopened.message_count(id).await.unwrap(), 1);
+            reopened
+                .append_message(id, 2, &wisp_llm::Message::user("after switch"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+                .fetch_one(&reopened.pool)
+                .await
+                .unwrap(),
+            4
+        );
+        let local = Store::open_read_only(&root.path().join("portable").join(PROJECT_DATABASE))
+            .await
+            .unwrap();
+        assert_eq!(local.message_count("portable").await.unwrap(), 2);
+        let archive = root.path().join("export.sqlite");
+        reopened
+            .export_project_database("central", &archive)
+            .await
+            .unwrap();
+        let imported = Store::open_application(&root.path().join("import.sqlite"))
+            .await
+            .unwrap();
+        let imported_root = root.path().join("imported");
+        std::fs::create_dir_all(&imported_root).unwrap();
+        imported
+            .import_project_database(&archive, "central", &imported_root)
+            .await
+            .unwrap();
+        assert_eq!(imported.message_count("central").await.unwrap(), 2);
+        assert!(!imported_root.join(PROJECT_DATABASE).exists());
+    }
+
+    #[tokio::test]
+    async fn recovered_workspace_import_respects_storage_preference() {
+        for enabled in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Store::open_application(&root.path().join("global.sqlite"))
+                .await
+                .unwrap();
+            store
+                .set_setting("decentralized_project_storage", &enabled.to_string())
+                .await
+                .unwrap();
+            let workspace = root.path().join("recovered");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let frames = store
+                .create_recovered_workspace_project(
+                    "p",
+                    "Recovered",
+                    workspace.to_str().unwrap(),
+                    "model",
+                    &[crate::RecoveredWorkspaceSession {
+                        source_session_id: "source".into(),
+                        source_path: "archive.json".into(),
+                        messages: vec![wisp_llm::Message::user("recovered history")],
+                        created_at: 1,
+                        updated_at: 2,
+                    }],
+                )
+                .await
+                .unwrap();
+            assert_eq!(store.message_count(&frames[0]).await.unwrap(), 1);
+            assert_eq!(workspace.join(PROJECT_DATABASE).exists(), enabled);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_and_default_project_upsert_leave_legacy_history_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("global.sqlite");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let legacy = Store::open(&path).await.unwrap();
+        legacy
+            .create_project("default", "Workspace", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        legacy
+            .create_frame("f", "default", "agent", "model")
+            .await
+            .unwrap();
+        legacy
+            .append_message("f", 1, &wisp_llm::Message::user("before upgrade"))
+            .await
+            .unwrap();
+        legacy.pool.close().await;
+
+        for seq in 2..=3 {
+            let store = Store::open_application(&path).await.unwrap();
+            // The desktop performs this upsert immediately after opening the
+            // store; it must not become a second implicit migration entry point.
+            store
+                .create_project("default", "Workspace", workspace.to_str().unwrap())
+                .await
+                .unwrap();
+            assert!(!workspace.join(".wisp").exists());
+            assert_eq!(store.message_count("f").await.unwrap(), seq - 1);
+            store
+                .append_message("f", seq, &wisp_llm::Message::user("after upgrade"))
+                .await
+                .unwrap();
+            assert_eq!(store.list_projects().await.unwrap().len(), 1);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project_locations")
+                    .fetch_one(&store.pool)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("project-migration-")));
+            store.pool.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn new_project_does_not_copy_the_legacy_database() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("global.sqlite");
+        let old_workspace = root.path().join("old");
+        std::fs::create_dir_all(&old_workspace).unwrap();
+        let legacy = Store::open(&path).await.unwrap();
+        legacy
+            .create_project("old", "Old", old_workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        legacy
+            .create_frame("old-frame", "old", "agent", "model")
+            .await
+            .unwrap();
+        legacy
+            .append_message(
+                "old-frame",
+                1,
+                &wisp_llm::Message::user("unrelated history"),
+            )
+            .await
+            .unwrap();
+        // A sentinel outside project tables detects whole-database copying
+        // without a flaky performance threshold or a gigabyte-sized fixture.
+        sqlx::query("CREATE TABLE unrelated_payload (data BLOB)")
+            .execute(&legacy.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO unrelated_payload VALUES(zeroblob(1048576))")
+            .execute(&legacy.pool)
+            .await
+            .unwrap();
+        // Upgraded application databases retain this retired column, whereas
+        // a newly migrated project database does not (#1426).
+        sqlx::query(
+            "ALTER TABLE projects ADD COLUMN default_specialist_id TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&legacy.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE projects SET default_specialist_id='legacy-specialist' WHERE id='old'")
+            .execute(&legacy.pool)
+            .await
+            .unwrap();
+        legacy.pool.close().await;
+
+        let store = open_portable_application(&path).await.unwrap();
+        let workspace = root.path().join("new");
+        store
+            .create_project("new", "New", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        store
+            .create_frame("new-frame", "new", "agent", "model")
+            .await
+            .unwrap();
+        store
+            .append_message("new-frame", 1, &wisp_llm::Message::user("new history"))
+            .await
+            .unwrap();
+        let local = Store::open_read_only(&workspace.join(PROJECT_DATABASE))
+            .await
+            .unwrap();
+        assert!(!sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='unrelated_payload')"
+        )
+        .fetch_one(&local.pool)
+        .await
+        .unwrap());
+        assert_eq!(local.message_count("new-frame").await.unwrap(), 1);
+        assert_eq!(local.message_count("old-frame").await.unwrap(), 0);
+        assert_eq!(store.message_count("old-frame").await.unwrap(), 1);
+        assert_eq!(store.list_projects().await.unwrap().len(), 2);
+        assert!(
+            !Store::has_column(&local.pool, "projects", "default_specialist_id")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT default_specialist_id FROM projects WHERE id='old'"
+            )
+            .fetch_one(&store.pool)
+            .await
+            .unwrap(),
+            "legacy-specialist"
+        );
+        assert_eq!(
+            local.get_project("new").await.unwrap(),
+            Some(("New".into(), workspace.to_string_lossy().into_owned()))
+        );
+        assert_no_migration_files(root.path());
+        assert_no_migration_files(&workspace.join(".wisp"));
+        assert!(!old_workspace.join(".wisp").exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM frames WHERE id='new-frame'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_new_project_publication_rolls_back_registration_and_can_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("global.sqlite");
+        let workspace = root.path().join("workspace");
+        let store = open_portable_application(&path).await.unwrap();
+        // Fail after the prepared database is published but before the global
+        // project and location transaction commits.
+        sqlx::query("CREATE TRIGGER fail_project_location BEFORE INSERT ON project_locations BEGIN SELECT RAISE(ABORT, 'simulated publication failure'); END")
+            .execute(&store.pool).await.unwrap();
+        assert!(store
+            .create_project("p", "Project", workspace.to_str().unwrap())
+            .await
+            .is_err());
+        assert!(store.get_project("p").await.unwrap().is_none());
+        let marker = workspace.join(".wisp/storage-migration.json");
+        assert!(marker.is_file());
+        assert!(workspace.join(PROJECT_DATABASE).is_file());
+        assert!(!workspace.join(PROJECT_METADATA).exists());
+        assert_no_migration_files(root.path());
+        assert_no_migration_files(&workspace.join(".wisp"));
+        sqlx::query("DROP TRIGGER fail_project_location")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        store.pool.close().await;
+
+        let reopened = open_portable_application(&path).await.unwrap();
+        assert!(reopened.list_projects().await.unwrap().is_empty());
+        assert!(marker.exists());
+        reopened
+            .create_project("p", "Project", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(!marker.exists());
+        assert!(workspace.join(PROJECT_METADATA).is_file());
+        reopened
+            .create_frame("f", "p", "agent", "model")
+            .await
+            .unwrap();
+        reopened
+            .append_message("f", 1, &wisp_llm::Message::user("after retry"))
+            .await
+            .unwrap();
+        let local = Store::open_read_only(&workspace.join(PROJECT_DATABASE))
+            .await
+            .unwrap();
+        assert_eq!(local.message_count("f").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_project_preparation_cleans_staging_and_preserves_legacy_history() {
+        for operation in ["INSERT", "DELETE"] {
+            let root = tempfile::tempdir().unwrap();
+            let workspace = root.path().join("workspace");
+            let store = Store::open_application(&root.path().join("global.sqlite"))
+                .await
+                .unwrap();
+            store
+                .create_project("p", "Project", workspace.to_str().unwrap())
+                .await
+                .unwrap();
+            store
+                .create_frame("f", "p", "agent", "model")
+                .await
+                .unwrap();
+            store
+                .append_message("f", 1, &wisp_llm::Message::user("retained history"))
+                .await
+                .unwrap();
+            // VACUUM copies this trigger into staging. INSERT fails during open;
+            // DELETE fails during sanitization with an active transaction.
+            sqlx::query(&format!("CREATE TRIGGER fail_preparation BEFORE {operation} ON execution_contexts BEGIN SELECT RAISE(ABORT, 'simulated preparation failure'); END"))
+            .execute(&store.pool).await.unwrap();
+            let error = store.migrate_project_storage("p").await.unwrap_err();
+            assert!(
+                error.to_string().contains("simulated preparation failure"),
+                "{error:#}"
+            );
+            assert_no_migration_files(root.path());
+            assert_no_migration_files(&workspace.join(".wisp"));
+            assert!(!workspace.join(PROJECT_DATABASE).exists());
+            assert!(!workspace.join(PROJECT_METADATA).exists());
+            assert_eq!(store.message_count("f").await.unwrap(), 1);
+            assert!(store.route_project("p").await.unwrap().is_none());
+            sqlx::query("DROP TRIGGER fail_preparation")
+                .execute(&store.pool)
+                .await
+                .unwrap();
+            store.migrate_project_storage("p").await.unwrap();
+            assert_eq!(store.message_count("f").await.unwrap(), 1);
+            assert_no_migration_files(root.path());
+            assert_no_migration_files(&workspace.join(".wisp"));
+        }
+    }
+
+    #[tokio::test]
+    async fn folder_snapshots_explicitly_migrate_legacy_history() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("global.sqlite");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let legacy = Store::open(&path).await.unwrap();
+        legacy
+            .create_project("p", "Project", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        legacy
+            .create_frame("f", "p", "agent", "model")
+            .await
+            .unwrap();
+        legacy
+            .append_message("f", 1, &wisp_llm::Message::user("legacy question"))
+            .await
+            .unwrap();
+        legacy.pool.close().await;
+        let store = Store::open_application(&path).await.unwrap();
+        assert!(!workspace.join(PROJECT_DATABASE).exists());
+        store.enable_folder_snapshots("p", "device").await.unwrap();
+        assert_eq!(store.message_count("f").await.unwrap(), 1);
+        assert!(workspace.join(PROJECT_METADATA).exists());
+        assert_eq!(store.folder_snapshot_projects().await.unwrap(), vec!["p"]);
+    }
+
+    #[tokio::test]
+    async fn live_writes_survive_removing_registration_and_new_global_database() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store = open_portable_application(&root.path().join("global.sqlite"))
+            .await
+            .unwrap();
+        store
+            .set_setting("provider_secret", "must stay global")
+            .await
+            .unwrap();
+        store
+            .create_project("p", "Project", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        store
+            .create_frame("f", "p", "agent", "model")
+            .await
+            .unwrap();
+        store
+            .append_message("f", 1, &wisp_llm::Message::user("a durable question"))
+            .await
+            .unwrap();
+        let memory = crate::GlobalMemory {
+            id: "memory".into(),
+            content: "Global preference".into(),
+            source_frame_id: Some("f".into()),
+            source_turn_index: Some(0),
+            created_at: 1,
+            updated_at: 1,
+        };
+        store.insert_global_memory(&memory).await.unwrap();
+        assert_eq!(store.list_global_memories(10).await.unwrap(), vec![memory]);
+        let local = Store::open_read_only(&workspace.join(PROJECT_DATABASE))
+            .await
+            .unwrap();
+        assert_eq!(local.message_count("f").await.unwrap(), 1);
+        assert_eq!(local.get_setting("provider_secret").await.unwrap(), None);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap(),
+            0
+        );
+        store.delete_project("p").await.unwrap();
+        let fresh = Store::open_application(&root.path().join("fresh.sqlite"))
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.register_project_folder(&workspace).await.unwrap(),
+            "p"
+        );
+        assert_eq!(fresh.message_count("f").await.unwrap(), 1);
+        fresh
+            .append_message("f", 2, &wisp_llm::Message::user("after reopening"))
+            .await
+            .unwrap();
+        assert_eq!(local.message_count("f").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_legacy_messages_and_project_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let path = root.path().join("global.sqlite");
+        let legacy = Store::open(&path).await.unwrap();
+        legacy
+            .create_project("p", "Project", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        legacy
+            .create_frame("f", "p", "agent", "model")
+            .await
+            .unwrap();
+        legacy
+            .append_message("f", 1, &wisp_llm::Message::user("legacy question"))
+            .await
+            .unwrap();
+        legacy
+            .set_setting("frame_plan_mode:f", "true")
+            .await
+            .unwrap();
+        legacy
+            .set_setting("project_enabled_skills:p", "[\"analysis\"]")
+            .await
+            .unwrap();
+        legacy
+            .set_setting("provider_configuration", "device only")
+            .await
+            .unwrap();
+        legacy.set_project_starred("p", true).await.unwrap();
+        let mut run = crate::RunRecord::new("run", "p", "local", "Running analysis", "shell");
+        run.status = crate::RunStatus::Running;
+        run.remote_handle_json = Some("{\"pid\":123}".into());
+        legacy.create_run(&run).await.unwrap();
+        let schedule = crate::ScheduleRecord {
+            replace_previous_turn: false,
+            id: "schedule".into(),
+            project_id: "p".into(),
+            frame_id: Some("f".into()),
+            name: "Follow up".into(),
+            prompt: "Continue".into(),
+            skill: None,
+            interval_secs: 3600,
+            enabled: true,
+            next_run_at: 100,
+            last_run_at: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        legacy.create_schedule(&schedule).await.unwrap();
+        let workflow = crate::AgentWorkflow::new("workflow", "p", "workspace", "Plan").unwrap();
+        legacy
+            .create_agent_workflow_plan(&workflow, &[])
+            .await
+            .unwrap();
+        legacy.pool.close().await;
+        let migrated = open_portable_application(&path).await.unwrap();
+        migrated.migrate_project_storage("p").await.unwrap();
+        migrated.set_project_starred("p", false).await.unwrap();
+        assert!(!migrated.starred_project_ids().await.unwrap().contains("p"));
+        assert_eq!(migrated.message_count("f").await.unwrap(), 1);
+        assert_eq!(
+            migrated
+                .get_setting("frame_plan_mode:f")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            migrated
+                .get_setting("project_enabled_skills:p")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("[\"analysis\"]")
+        );
+        assert_eq!(migrated.get_run("run").await.unwrap(), Some(run));
+        assert_eq!(
+            migrated.get_schedule("schedule").await.unwrap(),
+            Some(schedule)
+        );
+        assert_eq!(
+            migrated.get_agent_workflow("workflow").await.unwrap(),
+            Some(workflow)
+        );
+        let direct = Store::open_read_only(&workspace.join(PROJECT_DATABASE))
+            .await
+            .unwrap();
+        assert_eq!(
+            direct.get_setting("provider_configuration").await.unwrap(),
+            None
+        );
+        assert!(direct.list_execution_contexts().await.unwrap().is_empty());
+        assert!(workspace.join(PROJECT_METADATA).is_file());
+    }
+
+    #[tokio::test]
+    async fn failed_migration_keeps_legacy_data_and_can_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".wisp")).unwrap();
+        let path = root.path().join("global.sqlite");
+        let legacy = Store::open(&path).await.unwrap();
+        legacy
+            .create_project("p", "P", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        legacy
+            .create_frame("f", "p", "agent", "model")
+            .await
+            .unwrap();
+        legacy
+            .append_message("f", 1, &wisp_llm::Message::user("must not be lost"))
+            .await
+            .unwrap();
+        std::fs::write(workspace.join(PROJECT_DATABASE), b"unknown existing file").unwrap();
+        let deferred = open_portable_application(&path).await.unwrap();
+        assert!(deferred.migrate_project_storage("p").await.is_err());
+        assert_eq!(deferred.message_count("f").await.unwrap(), 1);
+        assert_eq!(
+            std::fs::read(workspace.join(PROJECT_DATABASE)).unwrap(),
+            b"unknown existing file"
+        );
+        std::fs::remove_file(workspace.join(PROJECT_DATABASE)).unwrap();
+        deferred.migrate_project_storage("p").await.unwrap();
+        assert_eq!(deferred.message_count("f").await.unwrap(), 1);
+        assert!(workspace.join(PROJECT_METADATA).exists());
+    }
+
+    #[tokio::test]
+    async fn interrupted_publication_retries_from_legacy_and_committed_cutover_repairs_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".wisp")).unwrap();
+        let path = root.path().join("global.sqlite");
+        let legacy = Store::open(&path).await.unwrap();
+        legacy
+            .create_project("p", "P", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        legacy
+            .create_frame("f", "p", "agent", "model")
+            .await
+            .unwrap();
+        legacy
+            .export_project_database("p", &workspace.join(PROJECT_DATABASE))
+            .await
+            .unwrap();
+        // The legacy store gained data after the failed cutover. Never select
+        // the older prepared file just because it exists.
+        legacy
+            .append_message("f", 1, &wisp_llm::Message::user("newer legacy record"))
+            .await
+            .unwrap();
+        let marker = MigrationMarker {
+            project_id: "p".into(),
+            application_database: legacy
+                .database_path()
+                .await
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            database_sha256: database_digest(&workspace.join(PROJECT_DATABASE)).unwrap(),
+        };
+        let marker_path = workspace.join(".wisp/storage-migration.json");
+        std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        let store = open_portable_application(&path).await.unwrap();
+        assert_eq!(store.message_count("f").await.unwrap(), 1);
+        // Restart serves the newer legacy records without retrying a large copy.
+        assert!(marker_path.exists());
+        assert!(!workspace.join(PROJECT_METADATA).exists());
+        store.migrate_project_storage("p").await.unwrap();
+        assert!(!marker_path.exists());
+        std::fs::remove_file(workspace.join(PROJECT_METADATA)).unwrap();
+        std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        let reopened = open_portable_application(&path).await.unwrap();
+        assert_eq!(reopened.message_count("f").await.unwrap(), 1);
+        assert!(workspace.join(PROJECT_METADATA).exists());
+        assert!(!marker_path.exists());
+    }
+
+    #[tokio::test]
+    async fn portable_live_frame_lookup_excludes_retained_tombstones() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("global.sqlite");
+        let store = open_portable_application(&path).await.unwrap();
+        store
+            .create_project("p", "Project", root.path().join("p").to_str().unwrap())
+            .await
+            .unwrap();
+        store
+            .create_frame("f", "p", "OPERON", "model")
+            .await
+            .unwrap();
+        store
+            .save_artifact(
+                "artifact",
+                "p",
+                "f",
+                "result.csv",
+                "text/csv",
+                "results/result.csv",
+            )
+            .await
+            .unwrap();
+        store
+            .create_run(&crate::RunRecord::new(
+                "run", "p", "local", "Analysis", "command",
+            ))
+            .await
+            .unwrap();
+        store
+            .save_run_artifact_link("link", "run", "artifact", "table")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.live_frame_project_id("f").await.unwrap().as_deref(),
+            Some("p")
+        );
+        store.delete_session("f", "p").await.unwrap();
+        assert_eq!(
+            store.frame_project_id("f").await.unwrap().as_deref(),
+            Some("p")
+        );
+        assert!(store.live_frame_project_id("f").await.unwrap().is_none());
+        let reader = Store::open_read_only(&path).await.unwrap();
+        assert_eq!(
+            reader.frame_project_id("f").await.unwrap().as_deref(),
+            Some("p")
+        );
+        assert!(reader.live_frame_project_id("f").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn independent_projects_support_concurrent_writes_search_copy_and_native_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("global.sqlite");
+        let store = open_portable_application(&path).await.unwrap();
+        for id in ["a", "b"] {
+            store
+                .create_project(id, id, root.path().join(id).to_str().unwrap())
+                .await
+                .unwrap();
+            store.create_frame(id, id, "agent", "model").await.unwrap();
+        }
+        let alpha = wisp_llm::Message::user("alpha");
+        let beta = wisp_llm::Message::user("beta");
+        let (a, b) = tokio::join!(
+            store.append_message("a", 1, &alpha),
+            store.append_message("b", 1, &beta),
+        );
+        a.unwrap();
+        b.unwrap();
+        store
+            .append_message("b", 2, &wisp_llm::Message::user("alpha only in the body"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .search_sessions(None, "alpha", 10, None, None)
+                .await
+                .unwrap()[0]
+                .id,
+            "a"
+        );
+        store
+            .create_publication("publication", "a", "Paper", "")
+            .await
+            .unwrap();
+        store
+            .create_publication_revision("revision", "publication", None, "Draft")
+            .await
+            .unwrap();
+        store
+            .begin_publication_freeze(
+                "revision",
+                "new-freeze-attempt",
+                &crate::PublicationFreezePolicy::default(),
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .abort_publication_freeze("revision", "new-freeze-attempt")
+            .await
+            .unwrap());
+        store.set_project_starred("b", true).await.unwrap();
+        let projects = store.list_projects().await.unwrap();
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].0, "b");
+        assert_eq!(projects[0].5, 1);
+        assert_eq!(
+            store
+                .search_sessions(None, "", 100, None, None)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        store
+            .copy_session_to_project("a", "a", "b", "copy")
+            .await
+            .unwrap();
+        assert_eq!(store.message_count("copy").await.unwrap(), 1);
+        store
+            .move_session_to_project("copy", "b", "a", "moved")
+            .await
+            .unwrap();
+        assert_eq!(store.frame_project_id("copy").await.unwrap(), None);
+        assert_eq!(
+            store.frame_project_id("moved").await.unwrap().as_deref(),
+            Some("a")
+        );
+        let native = Store::open_read_only(&path).await.unwrap();
+        assert_eq!(native.message_count("moved").await.unwrap(), 1);
+        let local = Store::open_read_only(&root.path().join("b").join(PROJECT_DATABASE))
+            .await
+            .unwrap();
+        assert_eq!(local.frame_project_id("a").await.unwrap(), None);
+        assert_eq!(
+            local.frame_project_id("b").await.unwrap().as_deref(),
+            Some("b")
+        );
+    }
+
+    #[tokio::test]
+    async fn project_database_deletion_releases_connections_and_blocks_reopening() {
+        let root = tempfile::tempdir().unwrap();
+        let store = open_portable_application(&root.path().join("global.sqlite"))
+            .await
+            .unwrap();
+        for id in ["removed", "healthy"] {
+            store
+                .create_project(id, id, root.path().join(id).to_str().unwrap())
+                .await
+                .unwrap();
+            store.create_frame(id, id, "agent", "model").await.unwrap();
+        }
+        let scoped = store.route_project("removed").await.unwrap().unwrap();
+        let pool = scoped.pool.clone();
+        assert!(!pool.is_closed());
+        let guard = store
+            .begin_project_database_deletion("removed")
+            .await
+            .unwrap();
+        assert!(pool.is_closed());
+        assert_eq!(pool.size(), 0);
+        assert!(store
+            .get_project("removed")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("deletion"));
+        assert!(scoped.get_project("removed").await.is_err());
+        assert!(store
+            .begin_project_database_deletion("removed")
+            .await
+            .is_err());
+        // A second deletion must not clear the first one's marker.
+        assert!(store.get_project("removed").await.is_err());
+        assert!(store.get_project("healthy").await.unwrap().is_some());
+
+        let workspace = root.path().join("removed");
+        assert!(std::fs::canonicalize(&workspace)
+            .unwrap()
+            .starts_with(std::fs::canonicalize(root.path()).unwrap()));
+        std::fs::remove_dir_all(&workspace).unwrap();
+        store.delete_project("removed").await.unwrap();
+        drop(guard);
+        assert!(store.get_project("removed").await.unwrap().is_none());
+        assert!(store.get_project("healthy").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn project_database_deletion_guard_allows_retry_after_interruption() {
+        let root = tempfile::tempdir().unwrap();
+        let store = open_portable_application(&root.path().join("global.sqlite"))
+            .await
+            .unwrap();
+        store
+            .create_project("p", "P", root.path().join("p").to_str().unwrap())
+            .await
+            .unwrap();
+        store
+            .create_frame("f", "p", "agent", "model")
+            .await
+            .unwrap();
+        store
+            .append_message("f", 1, &wisp_llm::Message::user("keep history"))
+            .await
+            .unwrap();
+        let guard = store.begin_project_database_deletion("p").await.unwrap();
+        assert!(store.get_project("p").await.is_err());
+        drop(guard);
+        assert_eq!(
+            store.load_messages("f").await.unwrap()[0].content.as_text(),
+            "keep history"
+        );
+        let retry = store.begin_project_database_deletion("p").await.unwrap();
+        drop(retry);
+        assert!(store.get_project("p").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn project_remote_source_checks_ignore_unrelated_missing_databases() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("global.sqlite");
+        let store = Store::open_application(&path).await.unwrap();
+        store
+            .create_project(
+                "central",
+                "Central",
+                root.path().join("central").to_str().unwrap(),
+            )
+            .await
+            .unwrap();
+        store
+            .set_setting("decentralized_project_storage", "true")
+            .await
+            .unwrap();
+        for id in ["offline", "online"] {
+            store
+                .create_project(id, id, root.path().join(id).to_str().unwrap())
+                .await
+                .unwrap();
+        }
+        store
+            .create_frame("f", "online", "agent", "model")
+            .await
+            .unwrap();
+        let uri = "ssh://gpu/data/result.bam";
+        store
+            .save_artifact_version(&crate::ArtifactVersionDraft {
+                version_id: None,
+                artifact_id: crate::logical_artifact_id("online", "path:result.bam"),
+                project_id: "online".into(),
+                root_frame_id: "f".into(),
+                filename: "result.bam".into(),
+                content_type: "data".into(),
+                storage_path: uri.into(),
+                logical_key: Some("path:result.bam".into()),
+                size_bytes: None,
+                checksum: None,
+                producing_run_id: None,
+                env_snapshot_hash: None,
+                materialization: crate::ArtifactMaterialization::External,
+                capture_timing: crate::ArtifactCaptureTiming::AtCreation,
+            })
+            .await
+            .unwrap();
+        store
+            .mark_external_artifacts_source_discarded("ssh://gpu/")
+            .await
+            .unwrap();
+        for pool in store.registry.as_ref().unwrap().pools.lock().await.values() {
+            pool.close().await;
+        }
+        store.pool.close().await;
+        let missing = root.path().join("offline").join(PROJECT_DATABASE);
+        std::fs::rename(&missing, root.path().join("saved.sqlite")).unwrap();
+        let store = Store::open_application(&path).await.unwrap();
+        assert!(store
+            .project_ssh_uri_source_discarded("online", uri)
+            .await
+            .unwrap());
+        assert!(!store
+            .project_ssh_uri_source_discarded("central", uri)
+            .await
+            .unwrap());
+        assert!(!store
+            .project_ssh_uri_source_discarded("online", "ssh://gpu/data/other.bam")
+            .await
+            .unwrap());
+        let error = store
+            .project_ssh_uri_source_discarded("offline", uri)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Remove from Wisp only"), "{error}");
+        // Unscoped checks retain their conservative behavior.
+        assert!(store.ssh_uri_source_discarded(uri).await.is_err());
+        assert!(!missing.exists());
+    }
+
+    #[tokio::test]
+    async fn offline_project_does_not_block_centralized_or_available_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("global.sqlite");
+        let store = Store::open_application(&path).await.unwrap();
+        for (id, decentralized) in [("central", false), ("offline", true), ("online", true)] {
+            store
+                .set_setting("decentralized_project_storage", &decentralized.to_string())
+                .await
+                .unwrap();
+            store
+                .create_project(id, id, root.path().join(id).to_str().unwrap())
+                .await
+                .unwrap();
+            store.create_frame(id, id, "agent", "model").await.unwrap();
+            store
+                .append_message(id, 1, &wisp_llm::Message::user("history"))
+                .await
+                .unwrap();
+        }
+        // Close every handle before moving the database, including on Windows.
+        for pool in store.registry.as_ref().unwrap().pools.lock().await.values() {
+            pool.close().await;
+        }
+        store.pool.close().await;
+        let missing = root.path().join("offline").join(PROJECT_DATABASE);
+        std::fs::rename(&missing, root.path().join("saved.sqlite")).unwrap();
+        let reopened = Store::open_application(&path).await.unwrap();
+        for id in ["central", "online"] {
+            assert_eq!(
+                reopened.frame_project_id(id).await.unwrap().as_deref(),
+                Some(id)
+            );
+            assert_eq!(reopened.message_count(id).await.unwrap(), 1);
+            assert_eq!(
+                reopened.load_messages(id).await.unwrap()[0]
+                    .content
+                    .as_text(),
+                "history"
+            );
+            assert!(reopened.session_branch_state(id).await.unwrap().is_none());
+            assert!(reopened.get_acp_session(id).await.unwrap().is_none());
+            assert!(!reopened.mainline_frame_is_frozen(id).await.unwrap());
+            assert!(reopened
+                .get_setting(&format!("frame_plan_mode:{id}"))
+                .await
+                .unwrap()
+                .is_none());
+            reopened
+                .append_message(id, 2, &wisp_llm::Message::user("after restart"))
+                .await
+                .unwrap();
+            assert_eq!(reopened.message_count(id).await.unwrap(), 2);
+            assert_eq!(
+                reopened
+                    .search_sessions(Some(id), "history", 10, None, None)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            // Absent optional records must be resolved in the owner's store.
+            assert!(reopened
+                .load_system_messages(&[id.to_owned()])
+                .await
+                .unwrap()
+                .is_empty());
+            reopened
+                .append_message(id, 0, &wisp_llm::Message::system(format!("rules for {id}")))
+                .await
+                .unwrap();
+        }
+        let prompts = reopened
+            .load_system_messages(&["central".into(), "online".into()])
+            .await
+            .unwrap();
+        assert_eq!(prompts.len(), 2);
+        for id in ["central", "online"] {
+            let content: wisp_llm::Content = serde_json::from_str(&prompts[id]).unwrap();
+            assert_eq!(content.as_text(), format!("rules for {id}"));
+        }
+        assert!(reopened
+            .message_count("offline")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unavailable"));
+        assert!(!missing.exists());
+        let native = Store::open_read_only(&path).await.unwrap();
+        assert_eq!(native.message_count("central").await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn registered_session_owner_never_falls_back_to_stale_global_records() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("global.sqlite");
+        let store = Store::open_application(&path).await.unwrap();
+        let workspace = root.path().join("project");
+        store
+            .create_project("p", "P", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        store
+            .create_frame("stale", "p", "agent", "model")
+            .await
+            .unwrap();
+        store
+            .append_message("stale", 1, &wisp_llm::Message::user("stale history"))
+            .await
+            .unwrap();
+        store
+            .append_message("stale", 0, &wisp_llm::Message::system("stale rules"))
+            .await
+            .unwrap();
+        // Model leftover global rows from an interrupted cutover. The registered
+        // database is authoritative even when it has no matching frame.
+        let database = root.path().join("authoritative.sqlite");
+        let authoritative = Store::open(&database).await.unwrap();
+        authoritative
+            .create_project("p", "P", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        authoritative.pool.close().await;
+        sqlx::query("INSERT INTO project_locations(project_id,database_path) VALUES(?,?)")
+            .bind("p")
+            .bind(database.to_str().unwrap())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(store.frame_project_id("stale").await.unwrap(), None);
+        assert_eq!(store.message_count("stale").await.unwrap(), 0);
+        assert!(store
+            .load_system_messages(&["stale".into()])
+            .await
+            .unwrap()
+            .is_empty());
+        for pool in store.registry.as_ref().unwrap().pools.lock().await.values() {
+            pool.close().await;
+        }
+        store.pool.close().await;
+        std::fs::rename(&database, root.path().join("saved.sqlite")).unwrap();
+        let reopened = Store::open_application(&path).await.unwrap();
+        assert!(reopened
+            .frame_project_id("stale")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unavailable"));
+        assert!(reopened.message_count("stale").await.is_err());
+        assert!(reopened
+            .append_message("stale", 2, &wisp_llm::Message::user("must not write"))
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE frame_id='stale'")
+                .fetch_one(&reopened.pool)
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(!database.exists());
+    }
+
+    #[tokio::test]
+    async fn missing_registered_database_never_creates_a_blank_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let store = open_portable_application(&root.path().join("global.sqlite"))
+            .await
+            .unwrap();
+        let workspace = root.path().join("workspace");
+        store
+            .create_project("p", "P", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        let database = workspace.join(PROJECT_DATABASE);
+        std::fs::rename(&database, workspace.join("saved.sqlite")).unwrap();
+        assert!(store
+            .create_frame("f", "p", "agent", "model")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unavailable"));
+        assert!(!database.exists());
+        // Only a regular file counts as the database, as before the stat moved
+        // off the runtime threads (#1668).
+        std::fs::create_dir(&database).unwrap();
+        assert!(store
+            .create_frame("f", "p", "agent", "model")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unavailable"));
+        std::fs::remove_dir(&database).unwrap();
+        let fresh = Store::open_application(&root.path().join("fresh.sqlite"))
+            .await
+            .unwrap();
+        assert!(fresh.register_project_folder(&workspace).await.is_err());
+        assert!(fresh.list_projects().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn export_import_and_sync_target_the_live_project_database() {
+        let root = tempfile::tempdir().unwrap();
+        let source = open_portable_application(&root.path().join("source.sqlite"))
+            .await
+            .unwrap();
+        source
+            .create_project("p", "P", root.path().join("source").to_str().unwrap())
+            .await
+            .unwrap();
+        source
+            .create_frame("f", "p", "agent", "model")
+            .await
+            .unwrap();
+        source
+            .append_message("f", 1, &wisp_llm::Message::user("exported"))
+            .await
+            .unwrap();
+        let archive = root.path().join("archive.sqlite");
+        source.export_project_database("p", &archive).await.unwrap();
+        let destination = root.path().join("target");
+        std::fs::create_dir_all(&destination).unwrap();
+        let target = open_portable_application(&root.path().join("target.sqlite"))
+            .await
+            .unwrap();
+        target
+            .import_project_database(&archive, "p", &destination)
+            .await
+            .unwrap();
+        assert_eq!(target.message_count("f").await.unwrap(), 1);
+        source
+            .append_message("f", 2, &wisp_llm::Message::user("synced"))
+            .await
+            .unwrap();
+        source.export_project_database("p", &archive).await.unwrap();
+        let state = super::super::ProjectSyncState::uninitialized("p", "folder", "relay");
+        target
+            .replace_project_database(&archive, "p", &destination, &state)
+            .await
+            .unwrap();
+        assert_eq!(
+            target.get_project_sync_state("p").await.unwrap(),
+            Some(state)
+        );
+        assert_eq!(target.message_count("f").await.unwrap(), 2);
+        let direct = Store::open_read_only(&destination.join(PROJECT_DATABASE))
+            .await
+            .unwrap();
+        assert_eq!(direct.message_count("f").await.unwrap(), 2);
+    }
+
+    fn backup_names(backups: &Path, tag: &str) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(backups) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(tag) && name.ends_with(".sqlite"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn another_versions_project_database_is_backed_up_outside_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("app").join("wisp.sqlite");
+        let backups = root.path().join("app").join("backups");
+        let workspace = root.path().join("study");
+        let database = workspace.join(PROJECT_DATABASE);
+        let store = open_portable_application(&path).await.unwrap();
+        store
+            .create_project("study", "Study", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        store
+            .create_frame("frame", "study", "agent", "model")
+            .await
+            .unwrap();
+        store
+            .append_message("frame", 1, &wisp_llm::Message::user("kept"))
+            .await
+            .unwrap();
+        // Neither project routing nor app opening performs daily backup I/O.
+        assert!(backup_names(&backups, ".pre-").is_empty());
+        assert!(backup_names(&backups, ".daily.").is_empty());
+        store.maintain_daily_backups().await;
+        assert_eq!(backup_names(&backups, ".daily.").len(), 2);
+
+        let stamp = |version: Option<i64>| {
+            let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&database);
+            async move {
+                let pool = SqlitePool::connect_with(options).await.unwrap();
+                if let Some(version) = version {
+                    sqlx::query(&format!("PRAGMA user_version={version}"))
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                }
+                let stamp: i64 = sqlx::query_scalar("PRAGMA user_version")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                Store::close_pool(&pool).await;
+                stamp
+            }
+        };
+        let current = stamp(None).await;
+        assert!(current > 0);
+        stamp(Some(1)).await;
+
+        // Each project is copied when this version first opens it.
+        let reopened = Store::open_application(&path).await.unwrap();
+        assert!(backup_names(&backups, ".pre-").is_empty());
+        assert_eq!(reopened.message_count("frame").await.unwrap(), 1);
+        assert_eq!(stamp(None).await, current);
+        let names = backup_names(&backups, ".pre-");
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].starts_with("project-study."), "{names:?}");
+        assert!(!workspace.join(".wisp").join("backups").exists());
+        let copy = Store::open_read_only(&backups.join(&names[0]))
+            .await
+            .unwrap();
+        assert_eq!(copy.message_count("frame").await.unwrap(), 1);
+    }
+
+    /// A portable project with one message, every pool closed, and its daily
+    /// copy either holding that message or deleted.
+    async fn closed_project_with_message(
+        root: &Path,
+        keep_copy: bool,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let path = root.join("app").join("wisp.sqlite");
+        let backups = root.join("app").join("backups");
+        let workspace = root.join("study");
+        let database = workspace.join(PROJECT_DATABASE);
+        let store = open_portable_application(&path).await.unwrap();
+        store
+            .create_project("study", "Study", workspace.to_str().unwrap())
+            .await
+            .unwrap();
+        store
+            .create_frame("frame", "study", "agent", "model")
+            .await
+            .unwrap();
+        // The desktop now schedules daily copies after first paint. Seed an
+        // empty copy explicitly, then verify recovery prefers the later one.
+        store.maintain_daily_backups().await;
+        store
+            .append_message("frame", 1, &wisp_llm::Message::user("kept"))
+            .await
+            .unwrap();
+        // Age the empty copy so the next maintenance pass takes another,
+        // which holds the message. Reopening alone must not create a copy.
+        for name in backup_names(&backups, "project-study.") {
+            let tail = name.splitn(3, '.').nth(2).unwrap().to_owned();
+            let old = backups.join(format!("project-study.20200101-000001.{tail}"));
+            std::fs::rename(backups.join(name), &old).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&old)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - 2 * crate::upgrade_backup::DAY)
+                .unwrap();
+        }
+        close_everything(store).await;
+        let reopened = Store::open_application(&path).await.unwrap();
+        assert_eq!(reopened.message_count("frame").await.unwrap(), 1);
+        assert_eq!(backup_names(&backups, "project-study.").len(), 1);
+        reopened.maintain_daily_backups().await;
+        assert_eq!(backup_names(&backups, "project-study.").len(), 2);
+        close_everything(reopened).await;
+        if !keep_copy {
+            std::fs::remove_dir_all(&backups).unwrap();
+        }
+        (path, database, backups)
+    }
+
+    async fn close_everything(store: Store) {
+        for pool in store.registry.as_ref().unwrap().pools.lock().await.values() {
+            Store::close_pool(pool).await;
+        }
+        Store::close_pool(&store.pool).await;
+    }
+
+    fn damaged_files(database: &Path) -> Vec<String> {
+        std::fs::read_dir(database.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".corrupt-"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_damaged_project_database_is_restored_from_its_newest_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let (path, database, backups) = closed_project_with_message(root.path(), true).await;
+        let copies = backup_names(&backups, "project-study.");
+        assert_eq!(copies.len(), 2, "{copies:?}");
+        // Page 1 keeps its header, so the file is still "a database" whose
+        // schema tree is gone: code 11, "database disk image is malformed".
+        let mut bytes = std::fs::read(&database).unwrap();
+        bytes[100..].fill(0);
+        std::fs::write(&database, bytes).unwrap();
+
+        let store = Store::open_application(&path).await.unwrap();
+        let error = store.get_project("study").await.unwrap_err().to_string();
+        let expected = format!("project_database_restored:{}:", copies[1]);
+        assert!(error.starts_with(&expected), "{error}");
+        let damaged = damaged_files(&database);
+        assert_eq!(damaged.len(), 1, "{damaged:?}");
+        assert!(error.ends_with(&damaged[0]), "{error}");
+        // The next attempt opens the restored database.
+        assert_eq!(
+            store.get_project("study").await.unwrap().unwrap().0,
+            "Study"
+        );
+        assert_eq!(store.message_count("frame").await.unwrap(), 1);
+        // The copies were not touched.
+        assert_eq!(backup_names(&backups, "project-study."), copies);
+    }
+
+    #[tokio::test]
+    async fn a_damaged_project_database_without_copies_is_rebuilt_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let (path, database, _) = closed_project_with_message(root.path(), false).await;
+        // Not a SQLite file at all: code 26, "file is not a database".
+        std::fs::write(&database, b"not a database".repeat(400)).unwrap();
+
+        let store = Store::open_application(&path).await.unwrap();
+        let error = store.get_project("study").await.unwrap_err().to_string();
+        let damaged = damaged_files(&database);
+        assert_eq!(damaged.len(), 1, "{damaged:?}");
+        assert_eq!(
+            error,
+            format!(
+                "project_database_rebuilt:{}",
+                database.with_file_name(&damaged[0]).display()
+            )
+        );
+        let (name, workspace) = store.get_project("study").await.unwrap().unwrap();
+        assert_eq!(name, "Study");
+        assert!(workspace.ends_with("study"), "{workspace}");
+        assert_eq!(store.message_count("frame").await.unwrap(), 0);
+    }
+}

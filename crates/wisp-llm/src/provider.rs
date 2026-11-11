@@ -1,0 +1,1501 @@
+//! Provider trait + streaming sink.
+
+use crate::{Completion, Message, ToolSchema};
+use async_trait::async_trait;
+
+const OPENAI_PYTHON_TOOL_ALIAS: &str = "wisp_python";
+
+/// Codex models reserve `python` for their hosted runtime. Keep Wisp's stable
+/// internal tool name, but avoid the collision on OpenAI-compatible wires.
+pub(crate) fn openai_wire_tool_name(name: &str) -> &str {
+    match name {
+        "python" => OPENAI_PYTHON_TOOL_ALIAS,
+        _ => name,
+    }
+}
+
+pub(crate) fn openai_internal_tool_name(name: &str) -> &str {
+    match name {
+        OPENAI_PYTHON_TOOL_ALIAS => "python",
+        _ => name,
+    }
+}
+
+/// OpenAI-compatible history must carry `tool_calls[].function.arguments` as
+/// a *valid* JSON string: strict gateways re-parse it and 400 with Python
+/// `json` errors like "Unterminated string" when the value is broken. Ours
+/// can be: context compaction cuts oversized arguments mid-string
+/// (`wisp-core` `bounded_latest_turn`), and a `finish_reason: "length"` turn
+/// can persist a half-written call. Replace anything that doesn't parse with
+/// an empty object, matching the Anthropic provider's stance.
+pub(crate) fn valid_json_tool_arguments(arguments: &str) -> String {
+    let trimmed = arguments.trim();
+    if !trimmed.is_empty() && serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return arguments.to_string();
+    }
+    "{}".to_string()
+}
+
+/// reqwest's Display hides the useful part ("connection refused", "proxy
+/// unreachable", dns errors) in `source()`; walk the chain so users see it (#77).
+pub(crate) fn error_chain(e: &reqwest::Error) -> String {
+    let mut s = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(cause) = src {
+        s.push_str(": ");
+        s.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    s
+}
+
+#[derive(Debug)]
+pub enum LlmError {
+    Http(reqwest::Error),
+    Decode(serde_json::Error),
+    Api {
+        status: u16,
+        body: String,
+    },
+    Config(String),
+    Incomplete,
+    /// A Responses-API turn that ended in a terminal status other than
+    /// `completed` (HTTP 200, but `incomplete`/`failed`/`cancelled`). Carries
+    /// the wire detail (`incomplete_details.reason` or `error.message`) so
+    /// callers can tell an exhausted output budget from a genuine failure.
+    NotCompleted {
+        status: String,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for LlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Provider envelopes bury the actionable sentence inside JSON
+            // (`{"error":{"message":"..."}}`); show just that sentence on the
+            // error card. The raw body stays on the struct untouched —
+            // `is_retriable` / `is_context_overflow` pattern-match on it.
+            LlmError::Api { status, body } => {
+                write!(f, "api: {status} {}", api_error_body_summary(body))
+            }
+            LlmError::Http(error) => write!(f, "http: {}", error_chain(error)),
+            LlmError::Decode(error) => write!(f, "decode: {error}"),
+            LlmError::Config(message) => write!(f, "config: {message}"),
+            LlmError::Incomplete => write!(f, "stream ended without completion"),
+            LlmError::NotCompleted { status, reason } => {
+                write!(f, "response ended with status '{status}' ({reason})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LlmError {}
+
+impl From<reqwest::Error> for LlmError {
+    fn from(error: reqwest::Error) -> Self {
+        LlmError::Http(error)
+    }
+}
+
+impl From<serde_json::Error> for LlmError {
+    fn from(error: serde_json::Error) -> Self {
+        LlmError::Decode(error)
+    }
+}
+
+/// Extract the one actionable sentence from a provider's JSON error envelope
+/// (`error.message`, or a top-level `message`). Unparseable bodies pass
+/// through unchanged.
+fn api_error_body_summary(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    value
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("message").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .unwrap_or_else(|| body.to_string())
+}
+
+pub type Result<T> = std::result::Result<T, LlmError>;
+
+impl LlmError {
+    /// The model stopped because it exhausted the output token budget
+    /// (`max_output_tokens`), so a retry with a larger budget can succeed.
+    pub fn output_limit_hit(&self) -> bool {
+        matches!(self, LlmError::NotCompleted { reason, .. } if reason == "max_output_tokens")
+    }
+    /// Provider rejected the request because the assembled prompt exceeds the
+    /// model context window.
+    pub fn is_context_overflow(&self) -> bool {
+        match self {
+            LlmError::Api { status, body } if matches!(*status, 400 | 413) => {
+                let lower = body.to_ascii_lowercase();
+                lower.contains("context length")
+                    || lower.contains("maximum context")
+                    || lower.contains("too many tokens")
+                    || lower.contains("context window")
+                    || lower.contains("prompt is too long")
+                    || lower.contains("token limit")
+                    || lower.contains("context_length_exceeded")
+                    || lower.contains("max context")
+                    || lower.contains("entity too large")
+                    || lower.contains("request entity too large")
+            }
+            _ => false,
+        }
+    }
+}
+
+const PROXY_ENV_KEYS: [&str; 6] = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
+/// Process environment proxy vars reqwest follows when Settings proxy is empty.
+pub fn ambient_proxy_env() -> Vec<(String, String)> {
+    PROXY_ENV_KEYS
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect()
+}
+
+/// How the current proxy setting / leftover env / OS system proxy should be
+/// named in an error. `system` is the platform proxy (macOS/Windows), not env.
+pub fn leftover_proxy_note(
+    configured: Option<&str>,
+    env: &[(String, String)],
+    system: Option<&str>,
+) -> Option<String> {
+    match configured.map(str::trim) {
+        Some("none") => None,
+        Some(url) if !url.is_empty() => Some(format!("via Model API proxy {url}")),
+        _ => env
+            .iter()
+            .find(|(_, value)| !value.trim().is_empty())
+            .map(|(key, value)| format!("via leftover {key}={value}"))
+            .or_else(|| {
+                system
+                    .map(str::trim)
+                    .filter(|url| !url.is_empty())
+                    .map(|url| format!("via system proxy {url}"))
+            }),
+    }
+}
+
+/// Connect failures (and leftover-proxy refusals) that look like `http: ...`.
+pub fn is_model_transport_failure(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("http: ")
+        && (m.contains("connect")
+            || m.contains("timed out")
+            || m.contains("deadline has elapsed")
+            || m.contains("dns")
+            || m.contains("refused")
+            || m.contains("proxy")
+            || m.contains("socks")
+            || m.contains("tunnel")
+            || m.contains("unreachable"))
+}
+
+/// Dead local proxies and connection-refused should fail the turn immediately.
+/// Retrying them is how a leftover `HTTPS_PROXY` becomes minutes of silence.
+pub fn is_fail_fast_transport(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("connection refused")
+        || m.contains("actively refused")
+        || m.contains("os error 10061")
+        || m.contains("os error 111")
+        || (m.contains("proxy")
+            && (m.contains("refused") || m.contains("tunnel") || m.contains("unreachable")))
+        || m.contains("via leftover")
+        || m.contains("via system proxy")
+}
+
+/// Append the active / leftover proxy so the UI can point at Settings.
+pub fn annotate_transport_error(
+    message: &str,
+    configured: Option<&str>,
+    env: &[(String, String)],
+) -> String {
+    if !is_model_transport_failure(message) {
+        return message.to_string();
+    }
+    let Some(note) = leftover_proxy_note(
+        configured,
+        env,
+        crate::system_proxy::ambient_system_proxy().as_deref(),
+    ) else {
+        return message.to_string();
+    };
+    if message.contains(&note) {
+        return message.to_string();
+    }
+    format!("{message} ({note})")
+}
+
+/// A compatible gateway kept the HTTP/SSE response at 2xx but encoded an
+/// upstream transport failure as an in-band error payload (#798). Kept
+/// narrow: authentication, billing and invalid-request errors must not
+/// become retry loops.
+fn is_in_band_transport_failure(status: u16, lower_body: &str) -> bool {
+    (200..=299).contains(&status)
+        && (lower_body.contains("upstream connection reset")
+            || lower_body.contains("connection reset by peer")
+            || lower_body.contains("upstream timeout")
+            || lower_body.contains("upstream timed out")
+            || lower_body.contains("unexpected eof")
+            || (lower_body.contains("eof") && lower_body.contains("codex: post")))
+}
+
+/// True when the model response started and then failed before its end
+/// marker: an SSE stream that closed early (`Incomplete`), a body transfer
+/// error or read timeout while waiting for the next chunk, or a gateway's
+/// in-band upstream failure. The agent loop recovers these inside the turn
+/// by rebuilding the request from the confirmed context (#1641).
+///
+/// Connection-establishment failures are deliberately excluded: they keep the
+/// request-retry / fail-fast classification of [`is_retriable`], so a dead
+/// local proxy still fails the turn immediately instead of reconnecting.
+pub fn is_stream_interruption(err: &LlmError) -> bool {
+    match err {
+        LlmError::Incomplete => true,
+        LlmError::Api { status, body } => {
+            is_in_band_transport_failure(*status, &body.to_ascii_lowercase())
+        }
+        LlmError::Http(e) => {
+            !e.is_connect() && !is_fail_fast_transport(&error_chain(e)) && e.is_body()
+        }
+        _ => false,
+    }
+}
+
+/// True for transient provider failures worth retrying (rate limits, overload, 5xx).
+pub fn is_retriable(err: &LlmError) -> bool {
+    match err {
+        LlmError::Api { status, body } => {
+            let lower = body.to_ascii_lowercase();
+            matches!(*status, 408 | 429)
+                || (500..=599).contains(status)
+                || is_in_band_transport_failure(*status, &lower)
+                || lower.contains("overloaded")
+                || lower.contains("rate_limit")
+                || lower.contains("1305")
+                || lower.contains("too many requests")
+                || lower.contains("访问量过大")
+        }
+        LlmError::Http(e) => {
+            // Connect failures include leftover local proxies. On Windows a
+            // closed Clash/V2Ray port is often `deadline has elapsed`, not
+            // ECONNREFUSED — retrying that looks like "sent, no reply".
+            if e.is_connect() || is_fail_fast_transport(&error_chain(e)) {
+                false
+            } else {
+                e.is_timeout() || e.is_request()
+            }
+        }
+        _ => false,
+    }
+}
+
+/// A healthy SSE stream always delivers a terminal marker before closing: a
+/// `finish_reason`/`stop_reason` chunk, or at least OpenAI's `[DONE]` line. A
+/// stream that closes with neither — and was not cancelled by the user — was
+/// cut mid-response (network drop, proxy kill, per-key concurrency limit), so
+/// the partial text must not be mistaken for a finished answer (#437).
+pub fn stream_was_cut(saw_terminal: bool, cancelled: bool) -> bool {
+    !saw_terminal && !cancelled
+}
+
+/// Which provider family to build.
+#[derive(Debug, Clone)]
+pub enum ProviderKind {
+    /// OpenAI / DeepSeek / Qwen / MiniMax / local Ollama / LM Studio — any
+    /// `/chat/completions` endpoint.
+    OpenAiCompatible,
+    /// OpenAI's first-party `/v1/responses` endpoint.
+    OpenAiResponses,
+    /// ChatGPT Plus/Pro subscription via the Codex responses endpoint (legacy).
+    OpenAiCodex,
+    /// Sign in with ChatGPT: `/v1/responses` with a plan-backed access token.
+    OpenAiChatGpt,
+    /// Anthropic Messages API (`/v1/messages`).
+    Anthropic,
+}
+
+/// Provider configuration. `base_url` is the API root (no `/chat/completions`).
+#[derive(Debug, Clone)]
+pub struct ProviderConfig {
+    pub kind: ProviderKind,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    /// Anthropic-only; ignored for OpenAI-compatible.
+    pub anthropic_version: String,
+    /// Cap on output tokens per turn.
+    pub max_tokens: u64,
+    /// Reasoning effort: `reasoning.effort` / `reasoning_effort` for OpenAI,
+    /// `output_config.effort` for Anthropic. None = provider default.
+    pub reasoning_effort: Option<String>,
+    /// DeepSeek thinking toggle. `Some(false)` sends `thinking: { type:
+    /// "disabled" }` on Chat Completions and `reasoning.effort: none` on
+    /// Responses, so a compact JSON call cannot burn its output budget on
+    /// hidden CoT. None = omit (DeepSeek V4 defaults to thinking on). Ignored
+    /// for non-DeepSeek hosts so OpenAI/local gateways are not sent an unknown
+    /// field.
+    pub thinking_enabled: Option<bool>,
+    /// OpenAI-compatible top-level `service_tier`. None = omit the field.
+    pub service_tier: Option<String>,
+    /// HTTP proxy override. `None`/empty = follow system/env proxy settings;
+    /// `"none"` = force a direct connection; otherwise a proxy URL
+    /// (`http://`, `https://`, `socks5://`).
+    pub proxy: Option<String>,
+    /// Per-profile User-Agent override. Empty uses the Wisp default.
+    pub user_agent: String,
+    pub send_user_agent: bool,
+    /// None follows the endpoint default (OpenCode only).
+    pub send_session_id: Option<bool>,
+    pub session_header_name: String,
+    /// Runtime conversation identity, never a model-profile setting. Hosts
+    /// should supply their durable conversation ID; standalone calls get a
+    /// fresh ID at construction, stable across requests and config clones.
+    pub session_id: String,
+}
+
+/// Shared reqwest client for all providers, honoring `cfg.proxy`.
+/// Process-wide connection pool for the default proxy configuration. Review /
+/// follow-up / memory side calls used to build a fresh `reqwest::Client` per
+/// call — every one of them paid a new TLS handshake before this cache. Explicit
+/// proxy configs stay per-client because they vary by profile.
+static SHARED_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+pub(crate) fn http_client(cfg: &ProviderConfig) -> reqwest::Client {
+    http_client_from_pool(cfg, &SHARED_CLIENT)
+}
+
+fn http_client_from_pool(
+    cfg: &ProviderConfig,
+    shared: &std::sync::OnceLock<reqwest::Client>,
+) -> reqwest::Client {
+    let proxy = cfg.proxy.as_deref().map(str::trim);
+    if matches!(proxy, None | Some("")) {
+        return shared.get_or_init(|| build_http_client(cfg)).clone();
+    }
+    build_http_client(cfg)
+}
+
+fn build_http_client(cfg: &ProviderConfig) -> reqwest::Client {
+    let mut b = reqwest::Client::builder()
+        // A total request timeout also caps a healthy, actively streaming SSE
+        // response. Long agent turns therefore used to die at five minutes
+        // even while bytes were still arriving. Bound connection setup and
+        // each individual read instead: active streams may run as long as
+        // needed, while a silent/broken socket still becomes a retriable
+        // reqwest timeout.
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(300));
+    match cfg.proxy.as_deref().map(str::trim) {
+        None | Some("") => {}
+        Some("none") => b = b.no_proxy(),
+        // Invalid URLs are rejected at settings save; if one sneaks in, fall
+        // back to ambient proxy behavior instead of panicking mid-turn.
+        Some(url) => {
+            if let Ok(p) = reqwest::Proxy::all(url) {
+                b = b.proxy(p);
+            }
+        }
+    }
+    b.build().unwrap_or_else(|error| {
+        tracing::error!(%error, "reqwest client build failed; using default client");
+        reqwest::Client::new()
+    })
+}
+
+/// Validate before trimming so pasted CR/LF cannot inject another header.
+pub fn normalize_user_agent(value: &str) -> std::result::Result<String, String> {
+    if value.bytes().any(|byte| !matches!(byte, 0x20..=0x7e)) {
+        return Err(
+            "User-Agent must contain only printable ASCII characters (no line breaks).".into(),
+        );
+    }
+    Ok(value.trim().to_string())
+}
+
+pub fn effective_user_agent(value: &str) -> &str {
+    match value.trim() {
+        "" => "wisp-science",
+        value => value,
+    }
+}
+
+pub fn normalize_session_header_name(value: &str) -> std::result::Result<String, String> {
+    if value.bytes().any(|byte| !matches!(byte, 0x20..=0x7e)) {
+        return Err("Session header name must be a valid HTTP header name.".into());
+    }
+    let name = value.trim().to_ascii_lowercase();
+    if name.is_empty() {
+        return Ok(name);
+    }
+    reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| "Session header name must be a valid HTTP header name.".to_string())?;
+    if matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "x-api-key"
+            | "cookie"
+            | "host"
+            | "content-length"
+            | "content-type"
+            | "transfer-encoding"
+            | "connection"
+            | "user-agent"
+            | "anthropic-version"
+    ) {
+        return Err(
+            "Session header name cannot replace authentication, transport, or User-Agent headers."
+                .into(),
+        );
+    }
+    Ok(name)
+}
+
+impl ProviderConfig {
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = session_id.into();
+        self
+    }
+
+    /// Apply identities per request: the HTTP pool is shared by conversations.
+    pub(crate) fn request_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        apply_request_identity(
+            request,
+            &self.base_url,
+            &self.user_agent,
+            self.send_user_agent,
+            &self.session_id,
+            self.send_session_id,
+            &self.session_header_name,
+        )
+    }
+
+    pub fn openai(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            model: model.into(),
+            anthropic_version: "2023-06-01".into(),
+            max_tokens: 8192,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            service_tier: None,
+            proxy: None,
+            user_agent: String::new(),
+            send_user_agent: true,
+            send_session_id: None,
+            session_header_name: String::new(),
+            session_id: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+    pub fn openai_responses(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ProviderKind::OpenAiResponses,
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            model: model.into(),
+            anthropic_version: "2023-06-01".into(),
+            max_tokens: 8192,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            service_tier: None,
+            proxy: None,
+            user_agent: String::new(),
+            send_user_agent: true,
+            send_session_id: None,
+            session_header_name: String::new(),
+            session_id: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+    pub fn openai_chatgpt(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ProviderKind::OpenAiChatGpt,
+            ..Self::openai_responses(base_url, api_key, model)
+        }
+    }
+    pub fn openai_codex(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ProviderKind::OpenAiCodex,
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            model: model.into(),
+            anthropic_version: "2023-06-01".into(),
+            max_tokens: 8192,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            service_tier: None,
+            proxy: None,
+            user_agent: String::new(),
+            send_user_agent: true,
+            send_session_id: None,
+            session_header_name: String::new(),
+            session_id: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+    pub fn anthropic(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ProviderKind::Anthropic,
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            model: model.into(),
+            anthropic_version: "2023-06-01".into(),
+            max_tokens: 8192,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            service_tier: None,
+            proxy: None,
+            user_agent: String::new(),
+            send_user_agent: true,
+            send_session_id: None,
+            session_header_name: String::new(),
+            session_id: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+}
+
+/// Apply only to model API requests, not generated-media download URLs.
+pub fn apply_request_identity(
+    mut request: reqwest::RequestBuilder,
+    base_url: &str,
+    user_agent: &str,
+    send_user_agent: bool,
+    session_id: &str,
+    send_session_id: Option<bool>,
+    session_header_name: &str,
+) -> reqwest::RequestBuilder {
+    if send_user_agent {
+        request = request.header(
+            reqwest::header::USER_AGENT,
+            effective_user_agent(user_agent),
+        );
+    }
+    if send_session_id.unwrap_or_else(|| is_opencode_endpoint(base_url)) {
+        let name = if session_header_name.trim().is_empty() {
+            "x-opencode-session"
+        } else {
+            session_header_name.trim()
+        };
+        request = request.header(name, session_id);
+    }
+    request
+}
+
+/// Parse the host and path rather than matching a substring in a gateway URL.
+pub fn is_opencode_endpoint(base_url: &str) -> bool {
+    url::Url::parse(base_url).ok().is_some_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str() == Some("opencode.ai")
+            && (url.path() == "/zen" || url.path().starts_with("/zen/"))
+    })
+}
+
+/// True when the request will hit DeepSeek's thinking-mode default.
+///
+/// Match the public API host or a `deepseek-*` model id so a custom gateway
+/// that still serves V4 Flash/Pro gets the same toggle. Gateway-style
+/// `vendor/model` ids (`deepseek/deepseek-v4.1-flash`) match on their last
+/// path segment, like the model catalog lookup. Other OpenAI-compatible hosts
+/// must not receive `thinking`, which they reject.
+pub(crate) fn is_deepseek_endpoint(base_url: &str, model: &str) -> bool {
+    let url = base_url.to_ascii_lowercase();
+    let model = model.trim().to_ascii_lowercase();
+    let tail = model.rsplit('/').next().unwrap_or(model.as_str());
+    url.contains("deepseek.com") || tail.starts_with("deepseek-")
+}
+
+/// Callbacks the agent loop receives while a streamed completion is in flight.
+pub trait StreamSink: Send {
+    fn on_text(&mut self, delta: &str);
+    fn on_reasoning(&mut self, delta: &str);
+    /// A tool call accumulated so far (index, name, arguments-so-far). Called
+    /// as argument fragments arrive so the UI can render an in-progress call.
+    fn on_tool_call(&mut self, index: usize, name: &str, arguments_so_far: &str);
+    fn on_usage(&mut self, usage: crate::Usage);
+    /// Whether the user requested cancellation. Streaming loops poll this each
+    /// chunk so a Stop interrupts token generation mid-stream, not only between
+    /// whole model turns. Default `false` for sinks that don't support cancel.
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// A no-op sink for callers that only want the final `Completion`.
+pub struct NullSink;
+impl StreamSink for NullSink {
+    fn on_text(&mut self, _: &str) {}
+    fn on_reasoning(&mut self, _: &str) {}
+    fn on_tool_call(&mut self, _: usize, _: &str, _: &str) {}
+    fn on_usage(&mut self, _: crate::Usage) {}
+}
+
+#[async_trait]
+pub trait Provider: Send + Sync {
+    fn name(&self) -> &str;
+    fn model(&self) -> &str;
+    /// Output-token cap this provider sends with each request, when it sends
+    /// one. Lets a truncation report name the real limit.
+    fn max_output_tokens(&self) -> Option<u64> {
+        None
+    }
+    /// Non-streaming completion.
+    async fn complete(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<Completion>;
+    /// Streaming completion; deltas go to `sink`, the assembled result is returned.
+    async fn stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        sink: &mut dyn StreamSink,
+    ) -> Result<Completion>;
+}
+
+/// Construct the concrete provider for a config.
+pub fn build(cfg: ProviderConfig) -> Box<dyn Provider> {
+    match cfg.kind {
+        ProviderKind::OpenAiCompatible => Box::new(crate::openai::OpenAiProvider::new(cfg)),
+        ProviderKind::OpenAiResponses | ProviderKind::OpenAiCodex | ProviderKind::OpenAiChatGpt => {
+            Box::new(crate::responses::OpenAiResponsesProvider::new(cfg))
+        }
+        ProviderKind::Anthropic => Box::new(crate::anthropic::AnthropicProvider::new(cfg)),
+    }
+}
+
+/// Incremental UTF-8 decoder for a chunked byte stream.
+///
+/// Network/TLS framing splits multi-byte characters across chunks (pervasive
+/// with CJK text). Decoding each chunk in isolation with
+/// `from_utf8(&bytes).unwrap_or("")` drops the *entire* chunk whenever it ends
+/// (or begins) mid-character, silently gutting streamed content — the cause of
+/// truncated/garbled writes. This holds back the incomplete trailing bytes and
+/// emits them once the rest of the character arrives.
+#[derive(Default)]
+pub struct Utf8Stream {
+    tail: Vec<u8>,
+}
+
+impl Utf8Stream {
+    /// Feed one chunk; return the text that is now complete. Any incomplete
+    /// trailing multi-byte sequence is retained until the next `push`.
+    pub fn push(&mut self, bytes: &[u8]) -> String {
+        self.tail.extend_from_slice(bytes);
+        match std::str::from_utf8(&self.tail) {
+            Ok(s) => {
+                let out = s.to_string();
+                self.tail.clear();
+                out
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                // `valid_up_to()` bytes are guaranteed valid UTF-8.
+                let out = String::from_utf8_lossy(&self.tail[..valid]).into_owned();
+                match e.error_len() {
+                    // A genuinely invalid sequence (not a boundary split): drop
+                    // it so a malformed stream can never stall the buffer.
+                    Some(bad) => self.tail.drain(..valid + bad),
+                    // Incomplete trailing char: keep it for the next chunk.
+                    None => self.tail.drain(..valid),
+                };
+                out
+            }
+        }
+    }
+}
+
+/// Incremental decoder for an SSE response body: UTF-8 reassembly plus
+/// line-ending normalisation, so every parser can split events on `"\n\n"`.
+///
+/// The SSE format allows LF, CRLF or a bare CR as the line terminator. Servers
+/// and proxies that emit `\r\n\r\n` between events otherwise never produce a
+/// `"\n\n"` and the whole stream goes unparsed. A terminator can also straddle
+/// two network chunks (`\r` at the end of one, `\n` at the start of the next),
+/// so the pending CR is remembered across `push` calls.
+#[derive(Default)]
+pub struct SseTextStream {
+    utf8: Utf8Stream,
+    /// The previous output ended on a CR already emitted as `\n`; a leading
+    /// LF now belongs to that same terminator.
+    after_cr: bool,
+}
+
+impl SseTextStream {
+    /// Feed one chunk; return the decoded text with every line terminator
+    /// rewritten to `\n`.
+    pub fn push(&mut self, bytes: &[u8]) -> String {
+        let text = self.utf8.push(bytes);
+        if !self.after_cr && !text.contains('\r') {
+            return text;
+        }
+        let mut out = String::with_capacity(text.len());
+        for ch in text.chars() {
+            match ch {
+                '\r' => {
+                    out.push('\n');
+                    self.after_cr = true;
+                }
+                '\n' if self.after_cr => self.after_cr = false,
+                other => {
+                    out.push(other);
+                    self.after_cr = false;
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deepseek_endpoint_matches_host_or_model_tail_segment() {
+        assert!(is_deepseek_endpoint(
+            "https://api.deepseek.com",
+            "deepseek-v4-flash"
+        ));
+        assert!(is_deepseek_endpoint(
+            "https://API.DeepSeek.com/v1",
+            "anything"
+        ));
+        assert!(is_deepseek_endpoint(
+            "https://gateway.test/v1",
+            "deepseek-v4-pro"
+        ));
+        // Gateway ids carry a vendor prefix; the toggle keys off the last segment.
+        assert!(is_deepseek_endpoint(
+            "https://api.commandcode.ai/provider/v1",
+            "deepseek/deepseek-v4.1-flash"
+        ));
+        assert!(is_deepseek_endpoint(
+            "https://gateway.test/v1",
+            " DeepSeek/DeepSeek-V4-Pro "
+        ));
+        // Other vendors behind the same gateway never receive `thinking`.
+        assert!(!is_deepseek_endpoint(
+            "https://api.commandcode.ai/provider/v1",
+            "google/gemini-3.8-flash"
+        ));
+        assert!(!is_deepseek_endpoint(
+            "https://gateway.test/v1",
+            "deepseek/other-v1"
+        ));
+        assert!(!is_deepseek_endpoint(
+            "https://api.openai.com/v1",
+            "gpt-5.6-sol"
+        ));
+    }
+
+    #[test]
+    fn opencode_identity_is_scoped_to_the_endpoint_and_conversation() {
+        let cfg = ProviderConfig::openai("https://opencode.ai/zen/go/v1", "key", "kimi-k3");
+        assert!(!cfg.session_id.is_empty());
+        assert_eq!(cfg.clone().session_id, cfg.session_id);
+        assert_ne!(
+            cfg.session_id,
+            ProviderConfig::openai("", "", "").session_id
+        );
+        let client = http_client(&cfg);
+        // The same connection pool serves independent conversation identities.
+        for id in ["frame-a", "frame-b", "frame-a"] {
+            let scoped = cfg.clone().with_session_id(id);
+            let request = scoped
+                .request_headers(client.post(&scoped.base_url))
+                .build()
+                .unwrap();
+            assert_eq!(request.headers()["x-opencode-session"], id);
+            assert_eq!(request.headers()["user-agent"], "wisp-science");
+        }
+        for endpoint in [
+            "https://opencode.ai/zen",
+            "https://OPENCODE.AI/zen/go/v1/messages",
+            "https://opencode.ai/zen/v1/responses",
+        ] {
+            assert!(is_opencode_endpoint(endpoint), "{endpoint}");
+        }
+        for endpoint in [
+            "https://opencode.ai.evil.test/zen/go/v1",
+            "https://opencode.ai@evil.test/zen/go/v1",
+            "https://example.test/opencode.ai/zen/go/v1",
+            "https://example.test/?url=https://opencode.ai/zen/go/v1",
+            "https://opencode.ai/zenith",
+            "https://opencode.ai/models",
+            "not a URL",
+        ] {
+            let mut scoped = cfg.clone();
+            scoped.base_url = endpoint.into();
+            assert!(!is_opencode_endpoint(endpoint), "{endpoint}");
+            let request = scoped
+                .request_headers(client.post("http://localhost/"))
+                .build()
+                .unwrap();
+            assert!(!request.headers().contains_key("x-opencode-session"));
+        }
+        let invalid = cfg.with_session_id("frame\r\nx-injected: true");
+        assert!(invalid
+            .request_headers(client.post(&invalid.base_url))
+            .build()
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn opencode_wire_headers_cover_protocols_modes_and_concurrent_sessions() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // An explicit loopback HTTP proxy captures the real requests without
+        // DNS, credentials, or access to the external service.
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for _ in 0..24 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                loop {
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&bytes[..end]);
+                    let header = |name: &str| -> String {
+                        head.lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                            .unwrap()
+                            .1
+                            .trim()
+                            .into()
+                    };
+                    let length = header("content-length").parse::<usize>().unwrap();
+                    if bytes.len() < end + 4 + length {
+                        continue;
+                    }
+                    assert_eq!(header("user-agent"), "wisp-science");
+                    let session = header("x-opencode-session");
+                    let target = head
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .to_string();
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
+                    assert_eq!(body["model"].as_str().unwrap(), session);
+                    captured.push((target, session));
+                    break;
+                }
+                socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+            }
+            captured
+        });
+        let mut clients = Vec::new();
+        for kind in [
+            ProviderKind::OpenAiCompatible,
+            ProviderKind::Anthropic,
+            ProviderKind::OpenAiResponses,
+        ] {
+            for id in ["session-a", "session-b"] {
+                let mut cfg =
+                    ProviderConfig::openai("http://opencode.ai/zen/go/v1", "fake-key", id)
+                        .with_session_id(id);
+                cfg.kind = kind.clone();
+                cfg.proxy = Some(proxy.clone());
+                clients.push(tokio::spawn(async move {
+                    // Rebuilding a provider (resume/model switch) retains the ID.
+                    for _ in 0..2 {
+                        let provider = build(cfg.clone());
+                        assert!(provider
+                            .complete(&[Message::user("test")], &[])
+                            .await
+                            .is_err());
+                        assert!(provider
+                            .stream(&[Message::user("test")], &[], &mut NullSink)
+                            .await
+                            .is_err());
+                    }
+                }));
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for client in clients {
+                client.await.unwrap();
+            }
+            let mut actual = server.await.unwrap();
+            actual.sort();
+            let mut expected = Vec::new();
+            for suffix in ["chat/completions", "messages", "responses"] {
+                for id in ["session-a", "session-b"] {
+                    for _ in 0..4 {
+                        expected.push((
+                            format!("http://opencode.ai/zen/go/v1/{suffix}"),
+                            id.to_string(),
+                        ));
+                    }
+                }
+            }
+            expected.sort();
+            assert_eq!(actual, expected);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn session_header_names_are_validated_without_overwriting_controlled_headers() {
+        assert_eq!(
+            normalize_session_header_name(" X-Conversation-ID ").unwrap(),
+            "x-conversation-id"
+        );
+        assert_eq!(normalize_session_header_name("").unwrap(), "");
+        for name in [
+            "x-session\r\nx-injected",
+            "x session",
+            "x:session",
+            "会话",
+            "Authorization",
+            "User-Agent",
+            "Content-Length",
+            "x-api-key",
+        ] {
+            assert!(
+                normalize_session_header_name(name).is_err(),
+                "accepted {name}"
+            );
+        }
+        let mut config = ProviderConfig::openai("https://opencode.ai/zen/go/v1", "key", "model");
+        config.send_session_id = Some(false);
+        config.send_user_agent = false;
+        let request = config
+            .request_headers(http_client(&config).post(&config.base_url))
+            .build()
+            .unwrap();
+        assert!(!request.headers().contains_key("user-agent"));
+        assert!(!request.headers().contains_key("x-opencode-session"));
+    }
+
+    #[test]
+    fn user_agent_validation_rejects_header_injection() {
+        assert_eq!(
+            normalize_user_agent("  research-client/1.0  ").unwrap(),
+            "research-client/1.0"
+        );
+        assert_eq!(normalize_user_agent("   ").unwrap(), "");
+        for invalid in [
+            "client\r\nX-Key: value",
+            "client\n",
+            "\tclient",
+            "客户端",
+            "client\0",
+            "client\x7f",
+        ] {
+            assert!(
+                normalize_user_agent(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_identity_controls_each_protocol_and_request_mode() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut agents = Vec::new();
+            for _ in 0..30 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                loop {
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&chunk[..count]);
+                    let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = head
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .unwrap()
+                        .1
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if request.len() < end + 4 + length {
+                        continue;
+                    }
+                    let values: Vec<_> = head
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                        .map(|(_, value)| value.trim().to_string())
+                        .collect();
+                    let sessions: Vec<_> = head
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .filter(|(name, _)| {
+                            matches!(*name, "x-opencode-session" | "x-project-session")
+                        })
+                        .map(|(name, value)| (name.to_string(), value.trim().to_string()))
+                        .collect();
+                    agents.push((values, sessions));
+                    break;
+                }
+                // Deliberate rejection: exercise real request sending without
+                // depending on any model-specific completion payload.
+                socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+            }
+            agents
+        });
+        for kind in [
+            ProviderKind::OpenAiCompatible,
+            ProviderKind::OpenAiResponses,
+            ProviderKind::Anthropic,
+        ] {
+            for (user_agent, send_user_agent, send_session_id, header_name) in [
+                ("", true, None, ""),
+                ("research-client/1.0", true, Some(true), "x-project-session"),
+                ("research-client/1.0", false, Some(true), ""),
+                ("", false, Some(false), "x-project-session"),
+                ("", true, Some(false), ""),
+            ] {
+                let mut cfg = ProviderConfig::openai(&base, "test-key", "test-model");
+                cfg.kind = kind.clone();
+                cfg.proxy = Some("none".into());
+                cfg.user_agent = user_agent.into();
+                cfg.send_user_agent = send_user_agent;
+                cfg.send_session_id = send_session_id;
+                cfg.session_header_name = header_name.into();
+                cfg.session_id = "stable-frame".into();
+                let provider = build(cfg);
+                assert!(provider
+                    .complete(&[Message::user("test")], &[])
+                    .await
+                    .is_err());
+                assert!(provider
+                    .stream(&[Message::user("test")], &[], &mut NullSink)
+                    .await
+                    .is_err());
+            }
+        }
+        let actual = server.await.unwrap();
+        let expected: Vec<_> = (0..3)
+            .flat_map(|_| {
+                [
+                    (vec!["wisp-science".to_string()], vec![]),
+                    (
+                        vec!["research-client/1.0".to_string()],
+                        vec![("x-project-session".to_string(), "stable-frame".to_string())],
+                    ),
+                    (
+                        vec![],
+                        vec![("x-opencode-session".to_string(), "stable-frame".to_string())],
+                    ),
+                    (vec![], vec![]),
+                    (vec!["wisp-science".to_string()], vec![]),
+                ]
+                .into_iter()
+                .flat_map(|entry| [entry.clone(), entry])
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn utf8_stream_reassembles_char_split_across_chunks() {
+        // "支气管" streamed with the byte boundaries falling *inside* each
+        // 3-byte character — the exact case that the old per-chunk decode drops.
+        let full = "支气管扩张 review body\n\n";
+        let bytes = full.as_bytes();
+        let mut s = Utf8Stream::default();
+        let mut out = String::new();
+        // 2-byte chunks guarantee splits mid-character for 3-byte CJK codepoints.
+        for chunk in bytes.chunks(2) {
+            out.push_str(&s.push(chunk));
+        }
+        assert_eq!(out, full, "content lost across chunk boundaries");
+        assert!(s.tail.is_empty(), "no bytes left dangling at stream end");
+    }
+
+    fn sse_text(chunks: &[&[u8]]) -> String {
+        let mut stream = SseTextStream::default();
+        chunks.iter().map(|chunk| stream.push(chunk)).collect()
+    }
+
+    #[test]
+    fn sse_text_stream_normalises_every_line_terminator() {
+        assert_eq!(
+            sse_text(&[b"data: a\n\ndata: b\n\n"]),
+            "data: a\n\ndata: b\n\n"
+        );
+        assert_eq!(
+            sse_text(&[b"event: x\r\ndata: a\r\n\r\ndata: b\r\n\r\n"]),
+            "event: x\ndata: a\n\ndata: b\n\n"
+        );
+        // Bare CR is a terminator too; a blank line is two of them.
+        assert_eq!(
+            sse_text(&[b"data: a\r\rdata: b\r\r"]),
+            "data: a\n\ndata: b\n\n"
+        );
+    }
+
+    #[test]
+    fn sse_text_stream_is_independent_of_chunk_boundaries() {
+        let wire = "event: delta\r\ndata: {\"t\":\"中文\"}\r\n\r\ndata: [DONE]\r\n\r\n".as_bytes();
+        let expected = "event: delta\ndata: {\"t\":\"中文\"}\n\ndata: [DONE]\n\n";
+        // Every two-chunk split, including between `\r` and `\n`, inside the
+        // `\r\n\r\n` separator and inside a multi-byte character.
+        for cut in 0..=wire.len() {
+            assert_eq!(
+                sse_text(&[&wire[..cut], &wire[cut..]]),
+                expected,
+                "cut at {cut}"
+            );
+        }
+        // One byte per chunk.
+        let bytes: Vec<&[u8]> = wire.chunks(1).collect();
+        assert_eq!(sse_text(&bytes), expected);
+    }
+
+    #[test]
+    fn sse_text_stream_keeps_a_blank_line_after_a_split_crlf() {
+        // `\r` | `\n\n`: the first LF completes the CRLF, the second is real.
+        assert_eq!(
+            sse_text(&[b"data: a\r", b"\n\ndata: b"]),
+            "data: a\n\ndata: b"
+        );
+    }
+
+    #[test]
+    fn utf8_stream_matches_whole_input_for_ascii() {
+        let mut s = Utf8Stream::default();
+        assert_eq!(s.push(b"data: {\"x\":1}\n\n"), "data: {\"x\":1}\n\n");
+    }
+
+    // Proxy setting variants must all yield a usable client — including an
+    // invalid URL (falls back to ambient proxy) — never a panic mid-turn.
+    #[test]
+    fn http_client_accepts_all_proxy_variants() {
+        for proxy in [
+            None,
+            Some(""),
+            Some("none"),
+            Some("http://127.0.0.1:7890"),
+            Some("socks5://127.0.0.1:1080"),
+            Some("::not a url::"),
+        ] {
+            let mut cfg = ProviderConfig::openai("https://api.example.com", "k", "m");
+            cfg.proxy = proxy.map(Into::into);
+            let _ = http_client(&cfg);
+        }
+    }
+
+    #[test]
+    fn default_proxy_configuration_reuses_one_client_pool() {
+        let shared = std::sync::OnceLock::new();
+        let cfg = ProviderConfig::openai("https://api.example.com", "k", "m");
+
+        let _first = http_client_from_pool(&cfg, &shared);
+        let initialized = shared
+            .get()
+            .expect("default client initializes shared pool") as *const _;
+        let mut custom = cfg.clone();
+        custom.user_agent = "research-client/1.0".into();
+        let _second = http_client_from_pool(&custom, &shared);
+        let reused = shared.get().expect("shared pool remains initialized") as *const _;
+
+        assert_eq!(initialized, reused);
+
+        let direct_pool = std::sync::OnceLock::new();
+        let mut direct = cfg;
+        direct.proxy = Some("none".into());
+        let _ = http_client_from_pool(&direct, &direct_pool);
+        assert!(
+            direct_pool.get().is_none(),
+            "explicit proxy modes must not reuse the default connection pool"
+        );
+    }
+
+    // #437: a stream that closes without a terminal marker is a cut, EXCEPT
+    // when the user hit Stop — that must keep returning the partial (#58).
+    #[test]
+    fn stream_cut_detection_spares_user_cancel() {
+        assert!(stream_was_cut(false, false), "silent EOF is a cut");
+        assert!(
+            !stream_was_cut(true, false),
+            "finish_reason/[DONE] is a clean end"
+        );
+        assert!(!stream_was_cut(false, true), "user Stop is not a cut");
+        assert!(!stream_was_cut(true, true));
+    }
+
+    #[test]
+    fn context_overflow_is_detected_from_provider_errors() {
+        assert!(LlmError::Api {
+            status: 400,
+            body: "maximum context length exceeded".into()
+        }
+        .is_context_overflow());
+        assert!(LlmError::Api {
+            status: 413,
+            body: "Request Entity Too Large".into()
+        }
+        .is_context_overflow());
+        assert!(!LlmError::Api {
+            status: 429,
+            body: "rate_limit".into()
+        }
+        .is_context_overflow());
+    }
+
+    #[test]
+    fn api_display_surfaces_the_envelope_message() {
+        let error = LlmError::Api {
+            status: 400,
+            body: r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages: roles must alternate between \"user\" and \"assistant\""}}"#.into(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "api: 400 messages: roles must alternate between \"user\" and \"assistant\""
+        );
+        // The raw body stays on the struct for pattern-based classifiers.
+        let LlmError::Api { body, .. } = &error else {
+            panic!()
+        };
+        assert!(body.contains("invalid_request_error"));
+    }
+
+    #[test]
+    fn api_display_passes_through_non_json_bodies() {
+        let error = LlmError::Api {
+            status: 500,
+            body: "upstream connection reset".into(),
+        };
+        assert_eq!(error.to_string(), "api: 500 upstream connection reset");
+    }
+
+    #[test]
+    fn transient_gateway_statuses_are_retried() {
+        for status in [500, 503, 504, 520, 522, 524, 529, 599] {
+            assert!(
+                is_retriable(&LlmError::Api {
+                    status,
+                    body: "gateway failure".into(),
+                }),
+                "status {status} should be retriable"
+            );
+        }
+        assert!(is_retriable(&LlmError::Api {
+            status: 400,
+            body: "OVERLOADED upstream".into(),
+        }));
+        assert!(!is_retriable(&LlmError::Api {
+            status: 400,
+            body: "invalid request".into(),
+        }));
+    }
+
+    #[test]
+    fn in_band_gateway_transport_failures_are_retried_without_retrying_permanent_errors() {
+        for body in [
+            "Codex: Post \"https://example.invalid/responses\": EOF (502: you can retry your request)",
+            "upstream connection reset",
+            "connection reset by peer",
+            "upstream timeout",
+            "upstream timed out",
+            "unexpected EOF",
+        ] {
+            assert!(is_retriable(&LlmError::Api { status: 200, body: body.into() }), "{body}");
+            for status in [400, 401, 403, 404, 422] {
+                assert!(!is_retriable(&LlmError::Api { status, body: body.into() }), "{status}: {body}");
+            }
+        }
+        for body in [
+            "insufficient balance",
+            "invalid API key",
+            "invalid request",
+            "JSON parse error: EOF",
+        ] {
+            assert!(
+                !is_retriable(&LlmError::Api {
+                    status: 200,
+                    body: body.into()
+                }),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn leftover_proxy_note_names_env_or_setting() {
+        assert_eq!(leftover_proxy_note(Some("none"), &[], None), None);
+        assert_eq!(
+            leftover_proxy_note(Some("http://127.0.0.1:7890"), &[], None).as_deref(),
+            Some("via Model API proxy http://127.0.0.1:7890")
+        );
+        let env = vec![("HTTPS_PROXY".into(), "http://127.0.0.1:7890".into())];
+        assert_eq!(
+            leftover_proxy_note(None, &env, None).as_deref(),
+            Some("via leftover HTTPS_PROXY=http://127.0.0.1:7890")
+        );
+        assert_eq!(leftover_proxy_note(Some("none"), &env, None), None);
+        assert_eq!(
+            leftover_proxy_note(None, &[], Some("http://127.0.0.1:10080")).as_deref(),
+            Some("via system proxy http://127.0.0.1:10080")
+        );
+        assert_eq!(
+            leftover_proxy_note(None, &env, Some("http://127.0.0.1:10080")).as_deref(),
+            Some("via leftover HTTPS_PROXY=http://127.0.0.1:7890"),
+            "env leftover is more specific than the OS system proxy"
+        );
+        assert_eq!(
+            leftover_proxy_note(Some("none"), &[], Some("http://127.0.0.1:10080")),
+            None
+        );
+        let raw = "http: error sending request: tunnel error: Connection refused (os error 61)";
+        assert!(is_fail_fast_transport(&format!(
+            "{raw} (via system proxy http://127.0.0.1:10080)"
+        )));
+    }
+
+    #[test]
+    fn connection_refused_fails_fast_and_is_annotated() {
+        let raw =
+            "http: error sending request: tcp connect error: Connection refused (os error 111)";
+        assert!(is_model_transport_failure(raw));
+        assert!(is_fail_fast_transport(raw));
+        let env = vec![("HTTPS_PROXY".into(), "http://127.0.0.1:7890".into())];
+        let annotated = annotate_transport_error(raw, None, &env);
+        assert!(annotated.contains("via leftover HTTPS_PROXY=http://127.0.0.1:7890"));
+        assert_eq!(
+            annotate_transport_error("api: 401 invalid key", None, &env),
+            "api: 401 invalid key"
+        );
+    }
+
+    #[test]
+    fn windows_proxy_refusal_fails_fast() {
+        assert!(is_fail_fast_transport(
+            "http: error sending request: No connection could be made because the target machine actively refused it. (os error 10061)"
+        ));
+        assert!(is_model_transport_failure(
+            "http: error sending request for url (https://api.example.com/v1/chat/completions): client error (Connect): tcp connect error: deadline has elapsed"
+        ));
+    }
+
+    #[test]
+    fn stream_interruptions_are_classified_apart_from_request_failures() {
+        assert!(is_stream_interruption(&LlmError::Incomplete));
+        // A 2xx SSE envelope carrying an upstream reset means the response
+        // had started: recover it, do not treat it as a fresh request retry.
+        let in_band = LlmError::Api {
+            status: 200,
+            body: "upstream connection reset".into(),
+        };
+        assert!(is_stream_interruption(&in_band));
+        assert!(is_retriable(&in_band));
+        // Overload is a request-level retry, not a cut stream.
+        let overloaded = LlmError::Api {
+            status: 503,
+            body: "overloaded".into(),
+        };
+        assert!(!is_stream_interruption(&overloaded));
+        assert!(is_retriable(&overloaded));
+        // Business errors enter neither loop.
+        for err in [
+            LlmError::Api {
+                status: 401,
+                body: "invalid api key".into(),
+            },
+            LlmError::Api {
+                status: 400,
+                body: "invalid_request_error".into(),
+            },
+            LlmError::Api {
+                status: 200,
+                body: "insufficient balance".into(),
+            },
+            LlmError::Config("bad profile".into()),
+            LlmError::NotCompleted {
+                status: "incomplete".into(),
+                reason: "max_output_tokens".into(),
+            },
+        ] {
+            assert!(!is_stream_interruption(&err), "{err}");
+            assert!(!is_retriable(&err), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn live_connection_refused_is_not_retriable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let err = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client")
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("closed port should refuse");
+        let wrapped = LlmError::Http(err);
+        assert!(
+            !is_retriable(&wrapped),
+            "a dead listener must not enter the multi-minute retry window: {wrapped}"
+        );
+        assert!(
+            !is_stream_interruption(&wrapped),
+            "a connect failure never started a stream, so it must not reconnect: {wrapped}"
+        );
+    }
+}

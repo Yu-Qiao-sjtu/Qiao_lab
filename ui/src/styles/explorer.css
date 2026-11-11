@@ -1,0 +1,159 @@
+/* ---------- Project meta + file browser ---------- */
+.proj-meta { font-size: calc(11px * var(--ui-font-scale, 1)); color: var(--text-faint); padding: 0 12px 8px; line-height: 1.4; }
+/* Capabilities grows with startup errors and the local-environment list, so it
+   scrolls like every other .modal instead of clipping its lower rows (#1639). */
+.modal-wide { max-width: 560px; max-height: min(80vh, 640px); overflow-x: hidden; overflow-y: auto; }
+.fb-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.fb-head h2 { margin: 0; }
+/* Location select + path crumb share one row. The select reads as a quiet
+   picker (no box until hover); the crumb only exists inside a subfolder. */
+.fb-bar { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.fb-source-label { display: flex; flex: 0 1 auto; min-width: 0; max-width: 60%; }
+.fb-bar .fb-crumb { flex: 1 1 auto; min-width: 0; }
+.fb-bar .fb-crumb:not(.remote)::before { content: "/"; flex: 0 0 auto; color: var(--text-faint); font-size: calc(12px * var(--ui-font-scale, 1)); }
+.fb-source { max-width: 100%; box-sizing: border-box; height: 28px; padding: 0 26px 0 8px; border: 1px solid transparent; border-radius: var(--radius-xs); appearance: none; -webkit-appearance: none; background: transparent var(--select-chevron) no-repeat right 9px center / 10px 6px; color: var(--text); font: inherit; font-size: calc(13px * var(--ui-font-scale, 1)); font-weight: 600; text-overflow: ellipsis; cursor: pointer; }
+.fb-source:hover { background-color: var(--surface-hover); }
+.fb-source:focus-visible { outline: none; border-color: var(--clay); }
+.fb-crumb { display: flex; align-items: center; gap: 4px; font-size: calc(12px * var(--ui-font-scale, 1)); color: var(--text-muted); }
+/* One non-wrapping toolbar: Upload keeps its label, the rest are icon
+   buttons whose label stays in the accessible name and the tooltip. */
+.fb-actions { display: flex; align-items: center; gap: 2px; flex-wrap: nowrap; min-width: 0; }
+.fb-actions button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 28px; min-width: 28px; padding: 0 8px; border: 1px solid transparent; border-radius: var(--radius-xs); background: transparent; color: var(--text-muted); font: inherit; font-size: calc(12px * var(--ui-font-scale, 1)); white-space: nowrap; cursor: pointer; transition: background .12s ease, color .12s ease; }
+.fb-actions button:hover:not(:disabled), .fb-actions button.active { background: var(--surface-hover); color: var(--text); }
+.fb-actions button[aria-pressed="true"] { background: var(--clay-soft); color: var(--clay-strong); }
+.fb-actions button:disabled { opacity: 0.55; cursor: default; }
+.fb-actions button svg { width: 15px; height: 15px; flex: 0 0 auto; }
+.fb-actions .fb-primary-action { padding: 0 10px 0 8px; border-color: var(--border); background: var(--bg-elev); color: var(--text); margin-right: 4px; }
+.fb-actions .fb-icon-action { width: 28px; padding: 0; }
+.fb-icon-action > span { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.fb-actions-spacer { flex: 1 1 auto; }
+.fb-search { width: 100%; box-sizing: border-box; padding: 7px 10px; margin: 0; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-input); color: var(--text); font: inherit; font-size: calc(12.5px * var(--ui-font-scale, 1)); }
+.fb-search:focus { outline: none; border-color: var(--clay); }
+.fb-up { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 26px; height: 26px; padding: 0; background: transparent; border: 1px solid transparent; border-radius: var(--radius-xs); cursor: pointer; font: inherit; color: var(--text-muted); }
+.fb-up:hover { background: var(--surface-hover); color: var(--text); }
+.fb-up svg { width: 15px; height: 15px; }
+.fb-path { font-family: var(--font-mono); font-size: calc(11.5px * var(--ui-font-scale, 1)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fb-path-input { min-width: 0; flex: 1 1 auto; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-xs); background: var(--bg-input); color: var(--text); font: inherit; }
+.fb-path-input:focus { outline: none; border-color: var(--clay); }
+/* Dense list rows: no per-row card, hover/selection carry the state. */
+.fb-list { display: flex; flex-direction: column; gap: 1px; max-height: 360px; overflow-y: auto; margin: 0; padding: 0; }
+.fb-row { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 32px; text-align: left; background: transparent; border: 1px solid transparent; border-radius: var(--radius-xs); padding: 5px 8px; cursor: pointer; font: inherit; color: var(--text); transition: background .12s ease, border-color .12s ease; }
+.fb-row:hover { background: var(--surface-hover); }
+.fb-row.selected, .fb-row.dir.selected { border-color: color-mix(in srgb, var(--clay) 40%, transparent); background: var(--clay-soft); }
+.fb-row-action { width: 26px; height: 26px; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; padding: 0; border: 1px solid transparent; border-radius: var(--radius-xs); background: transparent; color: var(--text-faint); cursor: pointer; }
+.fb-row-action:hover, .fb-row-action:focus-visible { border-color: var(--border-strong); background: var(--bg-sunken); color: var(--clay-strong); }
+.fb-row-action svg { width: 15px; height: 15px; }
+.fb-icon { display: inline-flex; flex: 0 0 auto; color: var(--text-faint); font-size: calc(14px * var(--ui-font-scale, 1)); }
+.fb-list:not(.grid) .fb-icon svg { width: 16px; height: 16px; }
+.fb-row.dir .fb-icon { color: var(--clay); }
+.fb-name { flex: 1 1 auto; font-size: calc(13px * var(--ui-font-scale, 1)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fb-size { flex: 0 0 auto; font-size: calc(11px * var(--ui-font-scale, 1)); color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.fb-sort { position: relative; }
+.fb-sort-backdrop { position: fixed; inset: 0; z-index: 71; }
+.fb-sort-menu {
+  position: absolute; z-index: 72; top: calc(100% + 4px); left: 0; min-width: 168px;
+  background: var(--bg-elev); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); box-shadow: 0 8px 28px rgba(0,0,0,.14); padding: 8px;
+  transform-origin: top left;
+  animation: motion-surface-in-soft var(--motion-duration-fast) var(--motion-ease-decelerate) both;
+}
+.fb-sort-label { font-size: calc(10.5px * var(--ui-font-scale, 1)); color: var(--text-faint); padding: 2px 6px 5px; }
+.fb-sort-opts { display: flex; flex-direction: column; gap: 1px; }
+.fb-sort-opt {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%;
+  background: transparent; border: none; border-radius: var(--radius-xs); padding: 6px 8px;
+  font: inherit; font-size: calc(13px * var(--ui-font-scale, 1)); color: var(--text); cursor: pointer; text-align: left;
+}
+.fb-sort-opt:hover { background: var(--bg-sunken); }
+.fb-sort-opt.active { color: var(--clay); }
+.fb-sort-check { display: inline-flex; opacity: 0; color: var(--clay); }
+.fb-sort-check.on { opacity: 1; }
+.fb-sort-check svg { width: 15px; height: 15px; }
+.fb-root { margin: 0; font-family: var(--font-mono); font-size: calc(10.5px * var(--ui-font-scale, 1)); color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fb-path-rel { flex: 0 0 auto; font-size: calc(11px * var(--ui-font-scale, 1)); color: var(--text-faint); font-family: var(--font-mono); max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-entry-location { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); }
+
+.rp-files {
+  flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 12px 10px; overflow: hidden;
+}
+.rp-files.drop-target { box-shadow: inset 0 0 0 2px var(--clay); border-radius: var(--radius-sm); }
+.rp-files .fb-list { max-height: none; flex: 1 1 auto; margin: 0; min-height: 0; }
+.rp-files-empty { margin: auto; padding: 24px 12px; color: var(--text-faint); font-size: calc(12.5px * var(--ui-font-scale, 1)); }
+.rp-files-empty p { margin: 0; }
+.fb-remote-error { gap: 10px; }
+.fb-error-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+.fb-retry { padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius-xs); background: var(--bg-input); color: var(--text); cursor: pointer; }
+/* Filled look comes from shared button.primary in base.css. */
+
+/* Tiled/grid mode: lay file rows out as centered cards with a large icon */
+.fb-list.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 8px; align-content: start; }
+.fb-list.grid .fb-row { flex-direction: column; align-items: center; text-align: center; gap: 8px; padding: 14px 8px; border-radius: var(--radius-sm); }
+.fb-list.grid .fb-icon svg { width: 30px; height: 30px; }
+.fb-list.grid .fb-name { flex: 0 0 auto; width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.fb-list.grid .fb-size, .fb-list.grid .fb-path-rel { display: none; }
+
+/* ---------- Provenance ---------- */
+.prov-list { padding: 10px; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; flex: 1; }
+.prov-item { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-sunken); }
+.prov-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer; font-size: calc(13px * var(--ui-font-scale, 1)); font-weight: 600; list-style: none; }
+.prov-head .ok { color: var(--ok); }
+.prov-head .fail { color: var(--err); }
+.prov-head .run { color: var(--text-faint); }
+.prov-body { margin: 0; padding: 8px 12px 12px; font-family: var(--font-mono); font-size: calc(11.5px * var(--ui-font-scale, 1)); line-height: 1.45; white-space: pre-wrap; max-height: 240px; overflow: auto; color: var(--text-muted); border-top: 1px solid var(--border); }
+
+/* ---------- Capabilities ---------- */
+.cap-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+.cap-stat {
+  display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 12px;
+  background: var(--bg-sunken); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); font: inherit; cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, transform .12s ease;
+}
+.cap-stat:hover { background: var(--surface-hover); border-color: var(--clay); transform: translateY(-1px); }
+.cap-stat:focus-visible { outline: 2px solid var(--clay); outline-offset: 2px; }
+.cap-num { font-size: calc(22px * var(--ui-font-scale, 1)); font-weight: 700; color: var(--clay); }
+.cap-label { font-size: calc(11px * var(--ui-font-scale, 1)); color: var(--text-faint); text-transform: uppercase; letter-spacing: .04em; }
+.cap-section { display: flex; flex-direction: column; gap: 8px; }
+.cap-section h3 { margin: 0; font-size: calc(13px * var(--ui-font-scale, 1)); font-weight: 600; color: var(--text-muted); }
+.cap-errors { margin: 0; padding-left: 26px; display: flex; flex-direction: column; gap: 6px; overflow-wrap: anywhere; }
+/* ---------- Skill Manager ---------- */
+.skill-tags-filter button {
+  background: var(--bg-input); color: var(--text-muted);
+  border: 1px solid var(--border); border-radius: var(--radius-xs);
+  padding: 7px 10px; font: inherit; font-size: calc(12.5px * var(--ui-font-scale, 1)); cursor: pointer;
+}
+.skill-tags-filter button:hover { color: var(--text); border-color: var(--border-strong); }
+.skill-tags-filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  max-height: 88px;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  flex-shrink: 0;
+}
+.skill-tags-filter button.active { color: var(--clay-strong); background: var(--clay-soft); border-color: color-mix(in srgb, var(--clay) 28%, var(--border-strong)); }
+.skill-tags-input {
+  width: 100%;
+  max-width: 360px;
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: calc(12px * var(--ui-font-scale, 1));
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--bg-input);
+  color: var(--text);
+  outline: none;
+  transition: border-color .12s ease, box-shadow .12s ease;
+}
+.skill-tags-input::placeholder { color: var(--text-faint); }
+.skill-tags-input:focus {
+  border-color: var(--clay);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}

@@ -1,0 +1,385 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    uses: ./.github/workflows/ci-changes.yml
+
+  release-notes-helper:
+    needs: changes
+    if: needs.changes.outputs.release_notes == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check release-notes title helper
+        run: bash scripts/github_release_notes.sh --self-test
+
+  headless-agent-eval:
+    needs: changes
+    if: needs.changes.outputs.headless == 'true'
+    name: Headless agent eval (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: headless-agent-${{ matrix.os }}
+
+      # wisp-cli now links wisp-store, whose Linux keyring backend needs libdbus
+      # at compile time even though debug builds persist secrets to a JSON file.
+      # The rust job gets this transitively via webkit/gtk; this job does not.
+      - name: Install Linux keyring build deps
+        if: runner.os == 'Linux'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|https://archive.ubuntu.com/ubuntu/|g' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Run MCP process-tree shutdown regression
+        run: cargo test -p wisp-mcp --test process_tree_shutdown
+
+      # An ACP agent starts helpers of its own (Codex keeps a node_repl per
+      # tool session). Stopping the agent must stop them on every OS (#1477).
+      - name: Run ACP agent process-tree regression
+        run: cargo test -p wisp-acp --test process
+
+      - name: Test repository build launcher
+        run: cargo test --locked -p wisp-dev
+
+      - name: Run project storage startup and migration regressions
+        run: cargo test -p wisp-store -- project_storage::tests upgrade_backup::tests
+
+      # Interpreters are often launchers: Windows Rscript.exe re-launches
+      # bin\x64\Rscript.exe through cmd.exe. Stopping a runtime must reclaim
+      # that whole tree, which only a real per-OS process tree can prove.
+      - name: Run runtime worker process-tree regression
+        run: cargo test -p wisp-runtime --test worker_process_tree
+
+      # Exercise the Python worker and standalone skill helpers on all three
+      # OSes, including process handling and project-relative planner paths.
+      - name: Run Python worker and skill helper tests (Unix)
+        if: runner.os != 'Windows'
+        run: python3 -m unittest discover -s python -p "test_*.py" -v
+
+      # python3 is not on PATH on windows-latest; the launcher is `python`.
+      - name: Run Python worker and skill helper tests (Windows)
+        if: runner.os == 'Windows'
+        run: python -m unittest discover -s python -p "test_*.py" -v
+
+      - name: Run deterministic headless agent suite
+        run: cargo run -p wisp-cli -- eval --artifacts target/headless-agent-eval --save target/headless-agent-eval/report.json
+
+      - name: Upload headless eval artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: headless-agent-eval-${{ matrix.os }}
+          path: target/headless-agent-eval
+          if-no-files-found: error
+
+  windows-native-input:
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    name: Windows native input reentrancy
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      WISP_CATALOG_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: windows-native-input
+      # An explicit target keeps host build-dependency features from masking
+      # missing Windows API features in the runtime (Tao uses windows 0.62).
+      - name: Check desktop Windows target feature isolation
+        run: cargo check --locked -p wisp-tauri --all-targets --target x86_64-pc-windows-msvc
+      - name: Build desktop and native regression with the locked runtime
+        run: cargo build --locked -p wisp-tauri --bin wisp-tauri --example windows_input_reentrancy_smoke
+      # Each invocation owns a hidden native window and has a 45-second
+      # watchdog. No WebView, real keyboard input, or user profile is involved.
+      - name: Repeat sent-message reentry and serial controls
+        shell: pwsh
+        run: |
+          for ($trial = 1; $trial -le 5; $trial++) {
+            & .\target\debug\examples\windows_input_reentrancy_smoke.exe
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & .\target\debug\examples\windows_input_reentrancy_smoke.exe --control
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+  macos-native-redraw:
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    name: macOS native redraw reentrancy
+    runs-on: macos-latest
+    timeout-minutes: 35
+    env:
+      WISP_CATALOG_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: macos-native-redraw
+      - name: Build desktop and native regression with the locked runtime
+        run: cargo build --locked -p wisp-tauri --bin wisp-tauri --example macos_redraw_reentrancy_smoke
+      # Each invocation owns a disposable native window and has a 45-second
+      # watchdog. No WebView, user profile, or external service is involved.
+      - name: Repeat redraw reentry, serial controls, and save-panel nested loops
+        run: |
+          set -euo pipefail
+          for trial in 1 2 3 4 5; do
+            ./target/debug/examples/macos_redraw_reentrancy_smoke
+            ./target/debug/examples/macos_redraw_reentrancy_smoke --control
+            ./target/debug/examples/macos_redraw_reentrancy_smoke --sheet
+          done
+
+  rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [stable, 1.90.0]
+    steps:
+      - uses: actions/checkout@v4
+
+      # A workspace version bump rebuilds every wisp-* crate next to the
+      # restored cache, which filled the runner's ~14 GB on Release v1.24.0.
+      # Drop preinstalled toolchains this job never uses (~20 GB) first.
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # Keep the workspace MSRV explicit; floating stable alone does not catch
+      # accidental dependency bumps past the version declared in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: rust-${{ matrix.toolchain }}
+
+      # src-tauri (workspace member) pulls in webkit2gtk/gtk3 on Linux; these
+      # aren't preinstalled on ubuntu-latest. See tauri.app/start/prerequisites.
+      # Cache the .debs: azure.archive.ubuntu.com often crawls (~80 kB/s) or
+      # hangs for hours on libwebkit2gtk-4.1-0 (~25 MB).
+      - name: Cache Tauri apt packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/apt-archives
+          key: apt-tauri-${{ runner.os }}-${{ runner.arch }}-webkit4.1-v1
+
+      - name: Install Tauri Linux dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          CACHE="${HOME}/.cache/apt-archives"
+          mkdir -p "${CACHE}/partial"
+          cleanup() {
+            sudo chown -R "$(id -u):$(id -g)" "${CACHE}" 2>/dev/null || true
+            rm -rf "${CACHE}/partial" "${CACHE}/lock"
+          }
+          trap cleanup EXIT
+          APT_OPTS=(
+            -o "Dir::Cache::archives=${CACHE}"
+            -o Acquire::Retries=3
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+          )
+          # azure.archive.ubuntu.com also hangs on the index fetch itself,
+          # burning the whole `apt-get update` budget on Ign retries. Point
+          # the runner's mirror list at the canonical archive and retry the
+          # update, so one slow mirror cannot fail the job.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|https://archive.ubuntu.com/ubuntu/|g' /etc/apt/apt-mirrors.txt
+          fi
+          for attempt in 1 2 3; do
+            sudo timeout 4m apt-get "${APT_OPTS[@]}" update && break
+            if [ "$attempt" = 3 ]; then
+              echo "apt-get update failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          sudo timeout 20m apt-get "${APT_OPTS[@]}" install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  ui-check:
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [stable, 1.90.0]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          targets: wasm32-unknown-unknown
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ui -> target
+          cache-on-failure: true
+          shared-key: ui-${{ matrix.toolchain }}
+      - name: cargo check (wasm UI crate)
+        run: cargo check --target wasm32-unknown-unknown
+        working-directory: ui
+
+  frontend-assets:
+    needs: changes
+    if: needs.changes.outputs.frontend_assets == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test incremental frontend asset staging
+        run: node --test ui/build-fast.test.mjs
+
+  relay-worker:
+    needs: changes
+    if: needs.changes.outputs.relay_worker == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test the Cloudflare relay rendezvous
+        run: node --test crates/wisp-sync/cloudflare/relay.test.mjs
+
+  # The suite (1,100 tests) is fully parallel (see ui-tests/playwright.config.ts)
+  # and split across runners: one runner with two workers needed ~40 minutes,
+  # four shards of four workers each finish in well under ten. A hang must fail
+  # fast instead of holding a runner for the six-hour default.
+  ui-e2e-shard:
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
+    name: ui-e2e (${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # Every shard builds the same wasm crate, so they share one cache entry;
+      # the first shard to finish saves it and the others only restore.
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ui -> target
+          cache-on-failure: true
+          shared-key: ui-e2e
+
+      - name: Cache Trunk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: trunk-${{ runner.os }}-v1
+
+      - name: Install Trunk
+        run: command -v trunk >/dev/null 2>&1 || cargo install trunk --locked
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright deps
+        working-directory: ui-tests
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: ui-tests
+        run: npx playwright install --with-deps chromium
+
+      - name: Playwright E2E
+        working-directory: ui-tests
+        run: npx playwright test --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+
+      # Failure diagnostics: error-context.md, screenshots and traces from
+      # test-results/, plus the HTML report when a reporter writes one. One
+      # artifact per shard so the four runners do not collide.
+      - name: Upload Playwright results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results-${{ matrix.shard }}
+          path: |
+            ui-tests/test-results/
+            ui-tests/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # One stable "ui-e2e" check over the shards for branch rules and PR monitors:
+  # green when every shard passed, or when the suite was skipped because no UI
+  # file changed; red when any shard failed or was cancelled.
+  ui-e2e:
+    needs: [changes, ui-e2e-shard]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check shard results
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          SHARDS: ${{ needs.ui-e2e-shard.result }}
+        run: |
+          echo "changes: ${CHANGES}; ui-e2e shards: ${SHARDS}"
+          [ "${CHANGES}" = success ] || exit 1
+          case "${SHARDS}" in
+            success|skipped) exit 0 ;;
+            *) exit 1 ;;
+          esac

@@ -1,0 +1,682 @@
+//! Authenticated loopback adapter for SwiftUI/WinUI settings. Rendering remains
+//! native; existing Tauri commands retain their validation and runtime ownership.
+use axum::{
+    extract::{DefaultBodyLimit, State},
+    http::{HeaderMap, StatusCode},
+    routing::post,
+    Json, Router,
+};
+use serde_json::Value;
+use std::{collections::HashMap, fs::OpenOptions, io::Write, sync::Arc, time::Duration};
+use tauri::{
+    ipc::{CallbackFn, InvokeBody, InvokeResponse, InvokeResponseBody},
+    Manager,
+};
+use tokio::sync::{oneshot, Mutex};
+use wisp_dto::native_settings::{HostDescriptor, Request, Response, COMMANDS, SCHEMA};
+
+#[derive(Clone)]
+pub(crate) struct Broker {
+    pub(crate) app: tauri::AppHandle,
+    pub(crate) conversations: Arc<crate::native_conversations::Conversations>,
+    pub(crate) workflow_conversions: Arc<crate::native_workflow_conversion::Progress>,
+    contexts: Arc<Mutex<HashMap<Option<String>, String>>>,
+    /// Stamped by the connection, never read from a request: true for the
+    /// remote tunnel, whose turns use the IM approval default.
+    pub(crate) remote: bool,
+}
+
+/// The one broker shared by the loopback native host and the remote tunnel,
+/// so both see the same conversation records and hidden command contexts.
+pub(crate) fn broker(app: &tauri::AppHandle) -> Broker {
+    if let Some(broker) = app.try_state::<Broker>() {
+        return broker.inner().clone();
+    }
+    let broker = Broker {
+        app: app.clone(),
+        conversations: Arc::new(crate::native_conversations::Conversations::default()),
+        workflow_conversions: Default::default(),
+        contexts: Default::default(),
+        remote: false,
+    };
+    if app.manage(broker.clone()) {
+        app.manage(broker.conversations.clone());
+    }
+    app.state::<Broker>().inner().clone()
+}
+
+pub(crate) fn remote_broker(app: &tauri::AppHandle) -> Broker {
+    Broker {
+        remote: true,
+        ..broker(app)
+    }
+}
+
+pub(crate) fn requested(args: impl IntoIterator<Item = String>) -> bool {
+    args.into_iter().any(|arg| arg == "--native-settings-host")
+}
+
+/// Keeps the host out of the Dock. Tao launches every app as Regular and so
+/// overrides the host bundle's `LSUIElement`; `setup` only runs after launch,
+/// where the icon would already flash, so this must precede `App::run`.
+#[allow(unused_mut)] // Only macOS mutates.
+pub(crate) fn background_policy(mut app: tauri::App) -> tauri::App {
+    #[cfg(target_os = "macos")]
+    if requested(std::env::args()) {
+        app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    }
+    app
+}
+
+pub(crate) fn start(app: &tauri::AppHandle) -> Result<(), String> {
+    if app.try_state::<HostDescriptor>().is_some() {
+        return Ok(());
+    }
+    let state = app.state::<crate::AppState>();
+    let root = state.app_data.clone();
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .map_err(|e| e.to_string())?;
+    let endpoint = format!(
+        "http://{}/invoke",
+        listener.local_addr().map_err(|e| e.to_string())?
+    );
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let descriptor = HostDescriptor {
+        schema: SCHEMA.into(),
+        endpoint,
+        token: token.clone(),
+        database: root.join("wisp.sqlite").to_string_lossy().into_owned(),
+        pid: std::process::id(),
+    };
+    let staging = root.join(format!(".native-settings-{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&staging).map_err(|e| e.to_string())?;
+    file.write_all(&serde_json::to_vec(&descriptor).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
+    std::fs::rename(&staging, root.join("native-settings.json")).map_err(|e| e.to_string())?;
+    let router = Router::new()
+        .route("/invoke", post(invoke))
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+        .with_state((broker(app), Arc::<str>::from(token)));
+    app.manage(descriptor);
+    tauri::async_runtime::spawn(async move {
+        if let Ok(listener) = tokio::net::TcpListener::from_std(listener) {
+            let _ = axum::serve(listener, router).await;
+        }
+    });
+    Ok(())
+}
+
+pub(crate) fn capabilities() -> Value {
+    serde_json::json!({
+        "commands": COMMANDS,
+        "schema": SCHEMA,
+        "conversations": wisp_dto::native_conversations::COMMANDS,
+        "runtimes": wisp_dto::native_runtimes::COMMANDS,
+        "conversation_schema": wisp_dto::native_conversations::SCHEMA,
+        "projects": wisp_dto::native_projects::COMMANDS,
+        "project_schema": wisp_dto::native_projects::SCHEMA,
+        "project_files": wisp_dto::native_files::PROJECT_COMMANDS,
+        "library": wisp_dto::native_library::COMMANDS,
+        "library_schema": wisp_dto::native_library::SCHEMA,
+        "assistant": wisp_dto::native_assistant::COMMANDS,
+        "assistant_schema": wisp_dto::native_assistant::SCHEMA,
+        "calendar": wisp_dto::native_calendar::COMMANDS,
+        "calendar_schema": wisp_dto::native_calendar::SCHEMA,
+        "checklist": [wisp_dto::research_checklist::COMMAND],
+        "checklist_schema": wisp_dto::research_checklist::SCHEMA,
+        "journey": wisp_dto::native_journey::COMMANDS,
+        "journey_schema": wisp_dto::native_journey::SCHEMA,
+        "memos": wisp_dto::native_memos::COMMANDS,
+        "memos_schema": wisp_dto::native_memos::SCHEMA,
+        "publication": wisp_dto::native_publication::COMMANDS,
+        "publication_schema": wisp_dto::native_publication::SCHEMA,
+        "privacy": ["get_privacy_mode", "set_privacy_mode"],
+        "onboarding": ["get_onboarding_state", "dismiss_onboarding"],
+        "search": wisp_dto::native_search::COMMANDS,
+        "search_schema": wisp_dto::native_search::SCHEMA,
+        "session_import": wisp_dto::native_session_import::COMMANDS,
+        "session_import_schema": wisp_dto::native_session_import::SCHEMA,
+    })
+}
+
+fn authorize(headers: &HeaderMap, expected: &str) -> bool {
+    // A browser origin is never a native settings client. No CORS is enabled.
+    !headers.contains_key("origin")
+        && headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == format!("Bearer {expected}"))
+}
+
+async fn invoke(
+    State((broker, token)): State<(Broker, Arc<str>)>,
+    headers: HeaderMap,
+    Json(request): Json<Request>,
+) -> Result<Json<Response>, StatusCode> {
+    if !authorize(&headers, &token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let result = dispatch(&broker, &request).await;
+    Ok(Json(Response {
+        schema: SCHEMA.into(),
+        id: request.id,
+        result: result.as_ref().ok().cloned(),
+        error: result.err(),
+    }))
+}
+
+pub(crate) async fn dispatch(broker: &Broker, request: &Request) -> Result<Value, String> {
+    if request.schema != SCHEMA || request.id.trim().is_empty() || !request.args.is_object() {
+        return Err("Invalid native settings request".into());
+    }
+    if request.command == "native_settings_capabilities" {
+        return Ok(capabilities());
+    }
+    if matches!(
+        request.command.as_str(),
+        "get_onboarding_state" | "dismiss_onboarding"
+    ) {
+        if broker.remote || request.project_id.is_some() || request.args != serde_json::json!({}) {
+            return Err("Onboarding takes no arguments and belongs to the local desktop".into());
+        }
+        let state = broker.app.state::<crate::AppState>();
+        return if request.command == "dismiss_onboarding" {
+            crate::app_commands::dismiss_onboarding(state).await?;
+            Ok(Value::Null)
+        } else {
+            serde_json::to_value(crate::app_commands::get_onboarding_state(state).await?)
+                .map_err(|e| e.to_string())
+        };
+    }
+    if request.command == "native_workflow_conversion_progress" {
+        let project = request
+            .project_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or("A project is required")?;
+        let input: wisp_dto::native_settings::WorkflowConversionProgressRequest =
+            serde_json::from_value(request.args.clone()).map_err(|error| error.to_string())?;
+        if !crate::native_workflow_conversion::valid_id(&input.conversion_id) {
+            return Err("A valid conversion id is required".into());
+        }
+        return serde_json::to_value(
+            broker
+                .workflow_conversions
+                .read(project, &input.conversion_id),
+        )
+        .map_err(|error| error.to_string());
+    }
+    if wisp_dto::native_files::PROJECT_COMMANDS.contains(&request.command.as_str()) {
+        let project = request
+            .project_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or("A project is required")?;
+        return crate::native_files::dispatch(broker, request, project, None).await;
+    }
+    if wisp_dto::native_projects::COMMANDS.contains(&request.command.as_str()) {
+        let state = broker.app.state::<crate::AppState>();
+        if request.command == "native_project_home_activity" {
+            if broker.remote || request.project_id.is_some() {
+                return Err("Home activity belongs to the local desktop".into());
+            }
+            let input: wisp_dto::native_projects::HomeActivityRequest =
+                serde_json::from_value(request.args.clone()).map_err(|e| e.to_string())?;
+            let running = state.running_turns.lock().await.clone();
+            let awaiting = state.awaiting_confirm.lock().unwrap().clone();
+            let snapshot =
+                crate::native_projects::home_activity(&state.store, &running, &awaiting, input)
+                    .await?;
+            return serde_json::to_value(snapshot).map_err(|e| e.to_string());
+        }
+        if request.command == "native_project_export" {
+            return crate::native_projects::execute_export(&state, request).await;
+        }
+        if request.command == "native_project_delete" {
+            return crate::native_projects::execute_delete(&state, request).await;
+        }
+        if matches!(
+            request.command.as_str(),
+            "native_project_recovery_preview" | "native_project_recover_workspace"
+        ) {
+            return crate::native_projects::execute_recovery(&state.store, request).await;
+        }
+        if wisp_dto::native_projects::returns_project_summary(&request.command) {
+            let id =
+                crate::native_projects::execute(&state.store, &state.app_data, request).await?;
+            return serde_json::to_value(crate::build_project_summary(&state, &id).await)
+                .map_err(|error| error.to_string());
+        }
+        if request.command == "native_project_session_delete_preview" {
+            return crate::native_session_deletion::preview(broker, request).await;
+        }
+        return crate::native_projects::execute_folders(&state.store, request).await;
+    }
+    if wisp_dto::native_library::COMMANDS.contains(&request.command.as_str()) {
+        let state = broker.app.state::<crate::AppState>();
+        return crate::native_library::execute(&state.library, request).await;
+    }
+    if request.command == "set_privacy_mode" {
+        if broker.remote || request.project_id.is_some() {
+            return Err("Privacy mode belongs to the local desktop".into());
+        }
+        let mode: crate::privacy_mode::PrivacyMode =
+            serde_json::from_value(request.args.clone()).map_err(|e| e.to_string())?;
+        let state = broker.app.state::<crate::AppState>();
+        state
+            .store
+            .write_project_privacy(mode, false)
+            .await
+            .map_err(|e| e.to_string())?;
+        return serde_json::to_value(crate::privacy_mode::load(&state.store).await?)
+            .map_err(|e| e.to_string());
+    }
+    if request.command == "get_privacy_mode" {
+        let state = broker.app.state::<crate::AppState>();
+        let mode =
+            crate::privacy_mode::read(&state.store, request.project_id.as_deref(), &request.args)
+                .await?;
+        return serde_json::to_value(mode).map_err(|error| error.to_string());
+    }
+    if wisp_dto::native_assistant::COMMANDS.contains(&request.command.as_str()) {
+        return crate::native_assistant::execute(broker, request).await;
+    }
+    if wisp_dto::native_calendar::COMMANDS.contains(&request.command.as_str()) {
+        let state = broker.app.state::<crate::AppState>();
+        return crate::native_calendar::execute(&state.store, request).await;
+    }
+    if request.command == wisp_dto::research_checklist::COMMAND {
+        if request.project_id.is_some() {
+            return Err("The research checklist is a global plan".into());
+        }
+        let input: wisp_dto::research_checklist::SyncRequest =
+            serde_json::from_value(request.args.clone()).map_err(|error| error.to_string())?;
+        let state = broker.app.state::<crate::AppState>();
+        let visible = crate::research_assistant::visible_projects(&state.store)
+            .await?
+            .into_iter()
+            .map(|project| project.0)
+            .collect();
+        let result = state
+            .store
+            .sync_research_checklist(&input, &visible)
+            .await
+            .map_err(|error| error.to_string())?;
+        return serde_json::to_value(result).map_err(|error| error.to_string());
+    }
+    if wisp_dto::native_search::COMMANDS.contains(&request.command.as_str()) {
+        let state = broker.app.state::<crate::AppState>();
+        return crate::native_search::execute(&state.store, request).await;
+    }
+    if wisp_dto::native_session_import::COMMANDS.contains(&request.command.as_str()) {
+        let state = broker.app.state::<crate::AppState>();
+        if request.command.starts_with("native_external_session_") {
+            return crate::codex_import::execute_native(&state, request).await;
+        }
+        return crate::session_import::execute_native(&state, request).await;
+    }
+    if wisp_dto::native_journey::COMMANDS.contains(&request.command.as_str()) {
+        let state = broker.app.state::<crate::AppState>();
+        let _activity = if matches!(
+            request.command.as_str(),
+            "native_research_journey_add" | "native_research_journey_recap"
+        ) {
+            Some(
+                state.begin_project_activity(
+                    request
+                        .project_id
+                        .as_deref()
+                        .ok_or("A project id is required")?,
+                )?,
+            )
+        } else {
+            None
+        };
+        return crate::native_journey::execute(&state.store, request).await;
+    }
+    if wisp_dto::native_memos::COMMANDS.contains(&request.command.as_str()) {
+        let state = broker.app.state::<crate::AppState>();
+        return crate::native_memos::execute(&state.store, request).await;
+    }
+    if wisp_dto::native_publication::COMMANDS.contains(&request.command.as_str()) {
+        let state = broker.app.state::<crate::AppState>();
+        let _activity = request
+            .project_id
+            .as_deref()
+            .map(|project| state.begin_project_activity(project))
+            .transpose()?;
+        return crate::native_publication::execute(&state.store, request).await;
+    }
+    if wisp_dto::native_runtimes::COMMANDS.contains(&request.command.as_str()) {
+        return crate::native_runtimes::dispatch(broker, request).await;
+    }
+    if wisp_dto::native_conversations::COMMANDS.contains(&request.command.as_str()) {
+        return crate::native_conversations::dispatch(broker, request).await;
+    }
+    if !COMMANDS.contains(&request.command.as_str()) {
+        return Err("Command is not available to native settings".into());
+    }
+    if matches!(
+        request.command.as_str(),
+        "enable_project_folder_sync" | "sync_project" | "resolve_project_sync"
+    ) {
+        let input = crate::native_projects::validate_sync_request(request)?;
+        let state = broker.app.state::<crate::AppState>();
+        let result = match request.command.as_str() {
+            "enable_project_folder_sync" => {
+                crate::project_sync::enable_project_folder_sync(state, input.id).await?
+            }
+            "sync_project" => crate::project_sync::sync_project(state, input.id).await?,
+            _ => {
+                let strategy = match input.strategy.ok_or("A conflict strategy is required")? {
+                    wisp_dto::native_projects::SyncConflictStrategy::Local => "local",
+                    wisp_dto::native_projects::SyncConflictStrategy::Remote => "remote",
+                };
+                crate::project_sync::resolve_project_sync(state, input.id, strategy.into()).await?
+            }
+        };
+        return serde_json::to_value(result).map_err(|error| error.to_string());
+    }
+    if matches!(
+        request.command.as_str(),
+        "native_terminal_snapshot" | "write_terminal" | "close_terminal"
+    ) {
+        let id = request
+            .args
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or("Missing authentication terminal id")?;
+        let snapshot = broker
+            .app
+            .state::<crate::terminal_sessions::TerminalManager>()
+            .native_auth_snapshot(id, request.project_id.as_deref())?;
+        if request.command == "native_terminal_snapshot" {
+            return serde_json::to_value(snapshot).map_err(|e| e.to_string());
+        }
+    }
+    if request.command == "native_download_update" {
+        crate::app_updates::download_update(
+            broker.app.state(),
+            tauri::ipc::Channel::new(|_| Ok(())),
+        )
+        .await?;
+        return Ok(Value::Null);
+    }
+    invoke_command(
+        broker,
+        request.project_id.clone(),
+        &request.command,
+        request.args.clone(),
+    )
+    .await
+}
+
+/// Hidden per-project window whose label scopes commands to that project.
+pub(crate) async fn context_label(
+    broker: &Broker,
+    project_id: Option<String>,
+) -> Result<String, String> {
+    Ok({
+        let mut contexts = broker.contexts.lock().await;
+        if let Some(label) = contexts.get(&project_id) {
+            label.clone()
+        } else {
+            if contexts.len() >= 32 {
+                return Err("Too many settings project contexts; restart the desktop host".into());
+            }
+            let active = if let Some(id) = &project_id {
+                Some(
+                    crate::project_commands::load_active_project(
+                        &broker.app.state::<crate::AppState>(),
+                        id,
+                    )
+                    .await?
+                    .0,
+                )
+            } else {
+                None
+            };
+            let label = format!("native-settings-{}", uuid::Uuid::new_v4().simple());
+            let handle = broker.app.clone();
+            let window_label = label.clone();
+            let (tx, rx) = oneshot::channel();
+            broker
+                .app
+                .run_on_main_thread(move || {
+                    let result = tauri::WebviewWindowBuilder::new(
+                        &handle,
+                        &window_label,
+                        tauri::WebviewUrl::App("native-host.html".into()),
+                    )
+                    .title("Wisp native settings host")
+                    .visible(false)
+                    .skip_taskbar(true)
+                    .on_navigation(crate::guard_webview_navigation)
+                    .build()
+                    .map_err(|e| e.to_string());
+                    if result.is_ok() {
+                        if let Some(active) = active {
+                            handle
+                                .state::<crate::AppState>()
+                                .set_active(&window_label, active);
+                        }
+                    }
+                    let _ = tx.send(result.map(|_| ()));
+                })
+                .map_err(|e| e.to_string())?;
+            rx.await.map_err(|_| "Settings host closed")??;
+            contexts.insert(project_id.clone(), label.clone());
+            label
+        }
+    })
+}
+
+pub(crate) async fn invoke_command(
+    broker: &Broker,
+    project_id: Option<String>,
+    command: &str,
+    args: Value,
+) -> Result<Value, String> {
+    let label = context_label(broker, project_id).await?;
+    let webview = broker
+        .app
+        .get_webview(&label)
+        .ok_or("Settings context closed")?;
+    // Native callers enter from Rust, not JavaScript; use the configured local
+    // app origin even before the inert context document finishes loading.
+    let url = if cfg!(debug_assertions) && !cfg!(feature = "custom-protocol") {
+        broker
+            .app
+            .config()
+            .build
+            .dev_url
+            .clone()
+            .unwrap_or(tauri::Url::parse("tauri://localhost").unwrap())
+    } else {
+        #[cfg(windows)]
+        let origin = "http://tauri.localhost";
+        #[cfg(not(windows))]
+        let origin = "tauri://localhost";
+        tauri::Url::parse(origin).unwrap()
+    };
+    let (tx, rx) = oneshot::channel();
+    webview.on_message(
+        tauri::webview::InvokeRequest {
+            cmd: command.to_owned(),
+            callback: CallbackFn(0),
+            error: CallbackFn(1),
+            url,
+            body: InvokeBody::Json(args),
+            headers: Default::default(),
+            invoke_key: broker.app.invoke_key().to_owned(),
+        },
+        Box::new(move |_, _, response, _, _| {
+            let result = match response {
+                InvokeResponse::Ok(InvokeResponseBody::Json(json)) => {
+                    serde_json::from_str(&json).map_err(|_| "Invalid command response".into())
+                }
+                InvokeResponse::Ok(InvokeResponseBody::Raw(_)) => {
+                    Err("Unsupported binary settings response".into())
+                }
+                InvokeResponse::Err(error) => Err(error
+                    .0
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| error.0.to_string())),
+            };
+            let _ = tx.send(result);
+        }),
+    );
+    if command == "send_message" {
+        // The host owns the turn; HTTP acceptance has already returned. Keep
+        // observing completion even if the UI disconnects or the turn is long.
+        return rx.await.map_err(|_| "Conversation host closed")?;
+    }
+    tokio::time::timeout(Duration::from_secs(660), rx)
+        .await
+        .map_err(|_| "Settings command timed out; refresh to check the result before retrying")?
+        .map_err(|_| "Settings host closed")?
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn windows_host_bundle_uses_an_asset_directory_not_a_drive_url() {
+        let override_config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.native-windows.conf.json")).unwrap();
+        let build: tauri::utils::config::BuildConfig =
+            serde_json::from_value(override_config["build"].clone()).unwrap();
+        let Some(tauri::utils::config::FrontendDist::Directory(path)) = build.frontend_dist else {
+            panic!("native Windows assets must not be interpreted as a c: URL");
+        };
+        assert_eq!(
+            path,
+            std::path::Path::new("../target/native-windows-host-assets")
+        );
+    }
+
+    use super::*;
+    #[test]
+    fn native_auth_rejects_browser_origins_and_missing_or_wrong_tokens() {
+        let mut headers = HeaderMap::new();
+        assert!(!authorize(&headers, "secret"));
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+        assert!(!authorize(&headers, "secret"));
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+        assert!(authorize(&headers, "secret"));
+        headers.insert("origin", "http://localhost".parse().unwrap());
+        assert!(!authorize(&headers, "secret"));
+    }
+    #[test]
+    fn only_explicit_host_launch_enables_native_settings() {
+        assert!(!requested(["wisp".into()]));
+        assert!(requested(["wisp".into(), "--native-settings-host".into()]));
+        assert!(!COMMANDS.contains(&"send_message"));
+        assert!(!COMMANDS.contains(&"shell"));
+        assert!(!COMMANDS.contains(&"native_project_create"));
+        assert!(!COMMANDS.contains(&"native_library_delete"));
+        assert!(!COMMANDS.contains(&"native_research_calendar"));
+        assert!(!COMMANDS.contains(&"native_research_journey"));
+        assert!(!COMMANDS.contains(&"native_publication_create"));
+        assert!(!COMMANDS.contains(&"native_conversation_attach"));
+        assert!(!COMMANDS.contains(&"native_conversation_enqueue"));
+        assert!(!COMMANDS.contains(&"get_privacy_mode"));
+        assert!(!COMMANDS.contains(&"set_privacy_mode"));
+        let advertised = capabilities();
+        assert_eq!(
+            advertised["checklist"][0],
+            wisp_dto::research_checklist::COMMAND
+        );
+        assert_eq!(
+            advertised["checklist_schema"],
+            wisp_dto::research_checklist::SCHEMA
+        );
+        assert_eq!(advertised["projects"][0], "native_project_create");
+        assert_eq!(
+            advertised["project_schema"],
+            wisp_dto::native_projects::SCHEMA
+        );
+        assert_eq!(advertised["library"][0], "native_library_search");
+        assert_eq!(advertised["library"][1], "native_library_delete");
+        assert_eq!(
+            advertised["library_schema"],
+            wisp_dto::native_library::SCHEMA
+        );
+        assert_eq!(advertised["calendar"][0], "native_research_calendar");
+        assert_eq!(
+            advertised["calendar_schema"],
+            wisp_dto::native_calendar::SCHEMA
+        );
+        assert_eq!(advertised["journey"][0], "native_research_journey");
+        assert_eq!(
+            advertised["journey_schema"],
+            wisp_dto::native_journey::SCHEMA
+        );
+        assert_eq!(advertised["publication"][0], "native_publication_workspace");
+        assert_eq!(advertised["publication"][1], "native_publication_create");
+        assert_eq!(
+            advertised["publication_schema"],
+            wisp_dto::native_publication::SCHEMA
+        );
+        assert_eq!(
+            advertised["privacy"],
+            serde_json::json!(["get_privacy_mode", "set_privacy_mode"])
+        );
+        assert_eq!(
+            advertised["onboarding"],
+            serde_json::json!(["get_onboarding_state", "dismiss_onboarding"])
+        );
+        assert_eq!(advertised["search"][0], "native_workspace_search");
+        assert_eq!(advertised["search_schema"], wisp_dto::native_search::SCHEMA);
+        assert_eq!(
+            advertised["session_import"][0],
+            "native_session_archive_preview"
+        );
+        assert_eq!(
+            advertised["session_import_schema"],
+            wisp_dto::native_session_import::SCHEMA
+        );
+        assert!(advertised["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command == "native_conversation_attach"));
+        assert!(advertised["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command == "native_conversation_enqueue"));
+        assert!(advertised["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|command| {
+                command != "native_project_create"
+                    && command != "native_library_search"
+                    && command != "native_library_delete"
+                    && command != "native_research_calendar"
+                    && command != "native_workspace_search"
+                    && command != "native_research_journey"
+                    && command != "native_publication_workspace"
+                    && command != "native_publication_create"
+                    && command != "native_conversation_attach"
+                    && command != "native_conversation_enqueue"
+                    && command != "get_privacy_mode"
+                    && command != "set_privacy_mode"
+            }));
+    }
+}
